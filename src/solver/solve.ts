@@ -1,22 +1,21 @@
-// Solver: lock a few cues at fixed starts and remove all overlaps.
+// Solver: move cues just enough to remove overlaps while honouring exact pins
+// and optional per-cue shot-cut windows.
 //
-// Variables x[i] >= 0 are integer cue starts; feasibility constraints are
-//   x[0] >= 0
+// Variables x[i] are integer cue starts. Constraints are
+//   earliest[i] <= x[i] <= latest[i], where omitted bounds default to the day
 //   x[i+1] >= x[i] + duration[i]
-//   x[n-1] <= DAY_MS
-// Pins force x[i] = start exactly. Objective: minimise sum |x[i] - base[i]|,
-// ties broken by the lexicographically smallest vector (cue order).
+//   x[i] = start for every pinned cue.
+// The objective is min Σ|x[i] - base[i]|; ties use the lexicographically
+// smallest complete start vector.
 //
-// Change of variable y[i] = x[i] - P[i], where P[i] = sum_{k<i} duration[k].
-// Then the gap constraints become y non-decreasing and the objective is
-// sum |y[i] - b[i]| with b[i] = base[i] - P[i] — L1 isotonic regression with
-// pinned observations. The lexicographically smallest minimiser is produced by
-// PAVA blocks taking their *lower weighted median*; pins are observations with
-// weight > total finite weight, so every block containing a pin evaluates to
-// the pin value. Pins split the problem into independent segments, each solved
-// by a PAVA stack; weighted medians inside blocks are maintained with meldable
-// leftist heaps (lo = lower half, max heap; hi = upper half, min heap), giving
-// O(n log n) overall, well inside 2 s for n = 20 000.
+// With P[i] = Σ_{k<i} duration[k] and y[i] = x[i] - P[i], gap constraints
+// become y non-decreasing. Windows become per-index boxes
+//   earliest[i] - P[i] <= y[i] <= latest[i] - P[i],
+// so the problem is bounded L1 isotonic regression with a few infinite-weight
+// pinned observations. A block PAVA solves it directly: adjacent fitted blocks
+// merge while their clipped lower weighted medians decrease. Bounds are kept as
+// the block's lower maximum / upper minimum; no unconstrained answer is later
+// trimmed cue-by-cue.
 
 export const DAY_MS = 86_400_000;
 
@@ -24,6 +23,10 @@ export interface Cue {
   start: number;
   duration: number;
   text: string;
+  /** Optional inclusive lower shot-cut bound; omitted means 0. */
+  earliest?: number;
+  /** Optional inclusive upper shot-cut bound; omitted means the day end. */
+  latest?: number;
 }
 
 /** cueIndex -> fixed integer start; one pin per cue, re-edit overwrites. */
@@ -35,9 +38,36 @@ export interface SolveInput {
   pins?: Pins;
 }
 
+export interface FeasibilityConflict {
+  /** First cue whose lower envelope cannot meet its inclusive upper bound. */
+  cueIndex: number;
+  /** Minimum start forced there by the cue itself and every preceding cue. */
+  requiredStart: number;
+  /** Inclusive maximum start permitted at that cue. */
+  allowedUpperBound: number;
+}
+
 export type SolveResult =
   | { ok: true; starts: number[]; cost: number }
-  | { ok: false; reason: 'INFEASIBLE' };
+  | { ok: false; reason: 'INVALID_WINDOW'; cueIndex: number }
+  | { ok: false; reason: 'INVALID_PIN'; cueIndex: number; pinStart: number }
+  | {
+      ok: false;
+      reason: 'WINDOW_INFEASIBLE';
+      conflict: FeasibilityConflict;
+    }
+  | {
+      ok: false;
+      reason: 'PIN_OUTSIDE_WINDOW';
+      pinStart: number;
+      conflict: FeasibilityConflict;
+    }
+  | {
+      ok: false;
+      reason: 'WINDOW_CHAIN_CONFLICT';
+      pinStart?: number;
+      conflict: FeasibilityConflict;
+    };
 
 /** Same contract as solve() with a configurable day span (tests use small U). */
 export function solveWithSpan(
@@ -49,6 +79,103 @@ export function solveWithSpan(
   return solveCore(cues, base, pins, daySpan);
 }
 
+interface ResolvedWindow {
+  low: number;
+  high: number;
+}
+
+function resolveWindow(
+  cue: Cue,
+  daySpan: number,
+): { ok: true; window: ResolvedWindow } | { ok: false } {
+  const low = cue.earliest === undefined ? 0 : cue.earliest;
+  const high = cue.latest === undefined ? daySpan : cue.latest;
+  if (
+    !Number.isInteger(low) ||
+    !Number.isInteger(high) ||
+    low < 0 ||
+    high < low ||
+    high > daySpan
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, window: { low, high } };
+}
+
+type ScanReason =
+  | 'WINDOW_INFEASIBLE'
+  | 'PIN_OUTSIDE_WINDOW'
+  | 'WINDOW_CHAIN_CONFLICT';
+
+interface ScanConflict extends FeasibilityConflict {
+  reason: ScanReason;
+  pinStart?: number;
+}
+
+/** Earliest conflict in the start-space lower-envelope scan. */
+function scanWindows(
+  cues: ReadonlyArray<Cue>,
+  windows: ReadonlyArray<ResolvedWindow>,
+): ScanConflict | null {
+  let required = 0;
+  for (let i = 0; i < cues.length; i++) {
+    required = Math.max(required, windows[i].low);
+    if (required > windows[i].high) {
+      return {
+        reason: 'WINDOW_INFEASIBLE',
+        cueIndex: i,
+        requiredStart: required,
+        allowedUpperBound: windows[i].high,
+      };
+    }
+    required += cues[i].duration;
+  }
+  return null;
+}
+
+function scanPins(
+  cues: ReadonlyArray<Cue>,
+  windows: ReadonlyArray<ResolvedWindow>,
+  pinAt: ReadonlyArray<number | null>,
+): ScanConflict | null {
+  let required = 0;
+  let lastPinStart: number | null = null;
+  for (let i = 0; i < cues.length; i++) {
+    required = Math.max(required, windows[i].low);
+    const pin = pinAt[i];
+
+    // A value outside the cue's own raw [earliest, latest] is first classified
+    // as a self-window violation, even if earlier pins have already made the
+    // propagated interval tighter.
+    if (pin !== null && (pin < windows[i].low || pin > windows[i].high)) {
+      return {
+        reason: 'PIN_OUTSIDE_WINDOW',
+        cueIndex: i,
+        requiredStart: required,
+        allowedUpperBound: windows[i].high,
+        pinStart: pin,
+      };
+    }
+
+    // The pin itself is inside its raw window but cannot be placed there after
+    // duration propagation (or a previous pin forces this later cue out).
+    if (pin !== null ? pin < required : required > windows[i].high) {
+      return {
+        reason: 'WINDOW_CHAIN_CONFLICT',
+        cueIndex: i,
+        requiredStart: required,
+        allowedUpperBound: windows[i].high,
+        pinStart: pin ?? lastPinStart!,
+      };
+    }
+
+    const value = pin === null ? required : pin;
+    if (pin !== null) lastPinStart = pin;
+    required = value + cues[i].duration;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Leftist heap of weighted observations. Nodes are mutated in place; heaps
 // are melded destructively (every observation belongs to exactly one block).
@@ -56,7 +183,7 @@ export function solveWithSpan(
 
 interface HNode {
   value: number;
-  weight: number; // observation weight
+  weight: number;
   rank: number;
   left: HNode | null;
   right: HNode | null;
@@ -66,11 +193,7 @@ function makeNode(value: number, weight: number): HNode {
   return { value, weight, rank: 1, left: null, right: null };
 }
 
-/**
- * Destructive leftist heap meld.
- * cmp < 0 means a belongs above b; mult = 1 gives a min heap, mult = -1 a max
- * heap. Equal values order arbitrarily (weight tie-breaks stay deterministic).
- */
+/** Destructive leftist heap meld. mult = 1 is a min heap, -1 a max heap. */
 function meld(
   a: HNode | null,
   b: HNode | null,
@@ -104,16 +227,19 @@ function popHi(h: HNode | null): HNode | null {
 }
 
 // ---------------------------------------------------------------------------
-// PAVA blocks.
+// Bounded PAVA blocks.
 // ---------------------------------------------------------------------------
 
 interface Block {
-  lo: HNode | null; // lower half (max heap), root is the block value candidate
+  lo: HNode | null; // lower half (max heap), root is the lower weighted median
   hi: HNode | null; // upper half (min heap)
   wLo: number;
   wHi: number;
-  total: number; // total observation weight
-  memberHead: EntryNode | null; // linked list of observations, index ascending
+  total: number;
+  boxLow: number; // max low bound in this contiguous block (transformed)
+  boxHigh: number; // min high bound in this contiguous block (transformed)
+  frozen: number | null; // exact pin value when a pin belongs to the block
+  memberHead: EntryNode | null;
   memberTail: EntryNode | null;
 }
 
@@ -122,7 +248,14 @@ interface EntryNode {
   next: EntryNode | null;
 }
 
-function singleton(index: number, value: number, weight: number): Block {
+function singleton(
+  index: number,
+  value: number,
+  weight: number,
+  boxLow: number,
+  boxHigh: number,
+  frozen: number | null,
+): Block {
   const head: EntryNode = { index, next: null };
   return {
     lo: makeNode(value, weight),
@@ -130,32 +263,48 @@ function singleton(index: number, value: number, weight: number): Block {
     wLo: weight,
     wHi: 0,
     total: weight,
+    boxLow,
+    boxHigh,
+    frozen,
     memberHead: head,
     memberTail: head,
   };
 }
 
-/** Merge PAVA block b into a (a precedes b). Rebalances to the lower weighted median. */
+function clamp(v: number, low: number, high: number): number {
+  return Math.min(high, Math.max(low, v));
+}
+
+/** A block's optimum is its lower weighted median projected onto its box. */
+function blockValue(block: Block): number {
+  return clamp(block.lo!.value, block.boxLow, block.boxHigh);
+}
+
+/** Merge PAVA block b into a (a precedes b). */
 function mergeBlocks(a: Block, b: Block): Block {
   a.lo = meld(a.lo, b.lo, -1);
   a.hi = meld(a.hi, b.hi, 1);
   a.wLo += b.wLo;
   a.wHi += b.wHi;
   a.total += b.total;
+  a.boxLow = Math.max(a.boxLow, b.boxLow);
+  a.boxHigh = Math.min(a.boxHigh, b.boxHigh);
+  if (a.frozen === null) a.frozen = b.frozen;
+  else if (b.frozen !== null && b.frozen !== a.frozen) {
+    // Feasibility pre-scans prevent decreasing exact pins from reaching here.
+    a.frozen = b.frozen;
+  }
   if (a.memberTail) a.memberTail.next = b.memberHead;
   else a.memberHead = b.memberHead;
   a.memberTail = b.memberTail;
 
-  // Lower weighted median m = smallest v with 2 * weight(<= v) >= total.
-  // lo holds values <= m (max heap at its root), hi values >= m (min heap).
+  // Maintain the unconstrained lower weighted median in lo. Bounds are applied
+  // only when reading blockValue(), which is exact for a common block box.
   for (;;) {
-    // Too little weight below the cut: pull the smallest hi value down.
     if (2 * a.wLo < a.total) {
       const node = a.hi!;
       a.hi = popHi(a.hi);
       a.wHi -= node.weight;
-      // node's children stayed in hi; detach before reinserting into lo so
-      // the node is never shared between both heaps (would create cycles).
       node.left = null;
       node.right = null;
       node.rank = 1;
@@ -163,7 +312,6 @@ function mergeBlocks(a: Block, b: Block): Block {
       a.wLo += node.weight;
       continue;
     }
-    // Too much weight in lo: its root is above the median, push it up.
     if (a.lo !== null && 2 * (a.wLo - a.lo.weight) >= a.total) {
       const node = a.lo;
       a.lo = popLo(a.lo);
@@ -175,8 +323,6 @@ function mergeBlocks(a: Block, b: Block): Block {
       a.wHi += node.weight;
       continue;
     }
-    // Inverted pair across the cut: exchange both roots. Every exchange
-    // resolves a distinct crossing pair, so the loop terminates.
     if (a.lo !== null && a.hi !== null && a.lo.value > a.hi.value) {
       const top = a.lo;
       const bot = a.hi;
@@ -199,72 +345,42 @@ function mergeBlocks(a: Block, b: Block): Block {
   return a;
 }
 
-/**
- * Isotonic regression on indices lo..hi of the transformed coordinates.
- * b[j] = base[j] - P[j]. Every fitted value is forced into the constant box
- * [floor, ceilL] — the per-index bounds are dominated by these under
- * isotonicity, and clamping targets before PAVA preserves the optimum.
- * Optional frozen pin endpoints: left block fixed to floor, right to ceilL —
- * each sentinel outweighs twice the whole segment, so its block value can
- * never move; feasibility guarantees floor <= ceilL so the sentinels never
- * merge into one another.
- */
-function solveSegment(
-  lo: number,
-  hi: number,
-  b: ReadonlyArray<number>,
-  floor: number,
-  ceilL: number,
-  leftPin: boolean,
-  rightPin: boolean,
-): { y: number[]; cost: number } {
-  // Every frozen endpoint outweighs twice the whole segment, so its block can
-  // never evaluate to anything but its pinned value.
-  const pinWeight = 2 * (hi - lo + 1) + 2;
-  const stack: Block[] = [];
-
-  const push = (index: number, value: number, weight: number): void => {
-    let blk = singleton(index, value, weight);
-    while (stack.length > 0) {
-      const top = stack[stack.length - 1];
-      // top.lo is never null (every block keeps at least the median in lo).
-      if (top.lo!.value <= blk.lo!.value) break;
-      stack.pop();
-      blk = mergeBlocks(top, blk);
-    }
-    stack.push(blk);
-  };
-
-  // Segment members are clamped to the constant feasible box; a fitted value
-  // at a box edge is equivalent in feasibility and the isotonic projection is
-  // unchanged because the frozen endpoint sentinels enforce monotonic access.
-  if (leftPin) push(lo - 1, floor, pinWeight);
-  for (let j = lo; j <= hi; j++) {
-    const v = Math.min(ceilL, Math.max(floor, b[j]));
-    push(j, v, 1);
-  }
-  if (rightPin) push(hi + 1, ceilL, pinWeight); // sentinel, output excluded
-
-  const y = new Array<number>(hi - lo + 1);
-  let cost = 0;
-  for (const blk of stack) {
-    const value = blk.lo!.value;
-    let entry = blk.memberHead;
-    while (entry !== null) {
-      const j = entry.index;
-      if (j >= lo && j <= hi) {
-        y[j - lo] = value;
-        // Cost is measured against the unclamped target b[j].
-        cost += Math.abs(value - b[j]);
-      }
-      entry = entry.next;
-    }
-  }
-  return { y, cost };
-}
-
 export function solve(input: SolveInput): SolveResult {
   return solveCore(input.cues, input.base, input.pins ?? new Map(), DAY_MS);
+}
+
+function failure(conflict: ScanConflict): SolveResult {
+  if (conflict.reason === 'WINDOW_INFEASIBLE') {
+    const {
+      reason,
+      cueIndex,
+      requiredStart,
+      allowedUpperBound,
+    } = conflict;
+    return {
+      ok: false,
+      reason,
+      conflict: { cueIndex, requiredStart, allowedUpperBound },
+    };
+  }
+  if (conflict.reason === 'PIN_OUTSIDE_WINDOW') {
+    const { reason, cueIndex, requiredStart, allowedUpperBound, pinStart } =
+      conflict;
+    return {
+      ok: false,
+      reason,
+      pinStart: pinStart!,
+      conflict: { cueIndex, requiredStart, allowedUpperBound },
+    };
+  }
+  const { reason, cueIndex, requiredStart, allowedUpperBound, pinStart } =
+    conflict;
+  return {
+    ok: false,
+    reason,
+    ...(pinStart === undefined ? {} : { pinStart }),
+    conflict: { cueIndex, requiredStart, allowedUpperBound },
+  };
 }
 
 function solveCore(
@@ -276,14 +392,12 @@ function solveCore(
   const n = cues.length;
   if (n === 0) return { ok: true, starts: [], cost: 0 };
 
-  // Prefix durations P[i] = sum_{k < i} duration[k].
-  const P = new Array<number>(n);
-  P[0] = 0;
-  for (let i = 0; i + 1 < n; i++) {
-    P[i + 1] = P[i] + cues[i].duration;
+  const windows: ResolvedWindow[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const resolved = resolveWindow(cues[i], daySpan);
+    if (!resolved.ok) return { ok: false, reason: 'INVALID_WINDOW', cueIndex: i };
+    windows[i] = resolved.window;
   }
-  const b = new Array<number>(n);
-  for (let i = 0; i < n; i++) b[i] = base[i] - P[i];
 
   const pinAt = new Array<number | null>(n).fill(null);
   for (const [idx, start] of pins) {
@@ -295,102 +409,96 @@ function solveCore(
       start < 0 ||
       start > daySpan
     ) {
-      return { ok: false, reason: 'INFEASIBLE' };
+      return {
+        ok: false,
+        reason: 'INVALID_PIN',
+        cueIndex: Number.isInteger(idx) ? idx : -1,
+        pinStart: Number.isInteger(start) ? start : Number.NaN,
+      };
     }
     pinAt[idx] = start;
   }
 
-  // Sorted pin indices.
-  const pinIdx: number[] = [];
-  for (let i = 0; i < n; i++) if (pinAt[i] !== null) pinIdx.push(i);
+  const windowConflict = scanWindows(cues, windows);
+  if (windowConflict) return failure(windowConflict);
+  const pinConflict = scanPins(cues, windows, pinAt);
+  if (pinConflict) return failure(pinConflict);
 
-  // Feasibility in x-space.
-  // Leading / interior / trailing prefix-duration bounds.
-  if (pinIdx.length > 0) {
-    const first = pinIdx[0];
-    if (pinAt[first]! < P[first]) return { ok: false, reason: 'INFEASIBLE' };
-    for (let k = 1; k < pinIdx.length; k++) {
-      const p = pinIdx[k - 1];
-      const q = pinIdx[k];
-      if (pinAt[q]! - pinAt[p]! < P[q] - P[p]) {
-        return { ok: false, reason: 'INFEASIBLE' };
-      }
-    }
-    const last = pinIdx[pinIdx.length - 1];
-    if (pinAt[last]! > daySpan - (P[n - 1] - P[last])) {
-      return { ok: false, reason: 'INFEASIBLE' };
-    }
-  } else if (P[n - 1] > daySpan) {
-    return { ok: false, reason: 'INFEASIBLE' };
+  // Prefix durations and transformed targets/bounds.
+  const P = new Array<number>(n);
+  P[0] = 0;
+  for (let i = 0; i + 1 < n; i++) P[i + 1] = P[i] + cues[i].duration;
+  const b = new Array<number>(n);
+  const lowY = new Array<number>(n);
+  const highY = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    b[i] = base[i] - P[i];
+    lowY[i] = windows[i].low - P[i];
+    highY[i] = windows[i].high - P[i];
   }
 
-  // Transformed pin values y = x - P[i].
-  const pinY = new Map<number, number>();
-  for (const i of pinIdx) pinY.set(i, pinAt[i]! - P[i]);
+  // A pin outweighs all ordinary observations combined, forcing its block's
+  // unconstrained weighted median to the exact transformed pin value.
+  const pinWeight = n + 1;
+  const stack: Block[] = [];
+  const push = (i: number): void => {
+    const pin = pinAt[i];
+    let blk =
+      pin === null
+        ? singleton(i, b[i], 1, lowY[i], highY[i], null)
+        : singleton(
+            i,
+            pin - P[i],
+            pinWeight,
+            lowY[i],
+            highY[i],
+            pin - P[i],
+          );
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1];
+      if (blockValue(top) <= blockValue(blk)) break;
+      stack.pop();
+      blk = mergeBlocks(top, blk);
+    }
+    stack.push(blk);
+  };
+  for (let i = 0; i < n; i++) push(i);
 
   const y = new Array<number>(n);
   let cost = 0;
-
-  if (pinIdx.length === 0) {
-    // Per-index bounds: y[0] >= 0 and y[n-1] <= daySpan - P[n-1]; all others
-    // are dominated by these and the isotonic chain.
-    const seg = solveSegment(0, n - 1, b, 0, daySpan - P[n - 1], false, false);
-    for (let i = 0; i < n; i++) y[i] = seg.y[i];
-    cost = seg.cost;
-  } else {
-    const first = pinIdx[0];
-    if (first > 0) {
-      // Leading segment: lower bound 0 dominates all y[i] >= -P[i].
-      const seg = solveSegment(
-        0,
-        first - 1,
-        b,
-        0,
-        pinY.get(first)!,
-        false,
-        true,
-      );
-      for (let t = 0; t < first; t++) y[t] = seg.y[t];
-      cost += seg.cost;
-    }
-    for (let k = 0; k < pinIdx.length; k++) {
-      const p = pinIdx[k];
-      const q = k + 1 < pinIdx.length ? pinIdx[k + 1] : n;
-      y[p] = pinY.get(p)!;
-      // The pinned cue's own displacement is a constant under the constraint
-      // but still belongs to the total absolute displacement.
-      cost += Math.abs(pinY.get(p)! - b[p]);
-      if (p + 1 <= q - 1) {
-        // Trailing: upper bound daySpan - P[n-1] dominates y[i] <= D - P[i].
-        const isTrailing = q === n;
-        const seg = solveSegment(
-          p + 1,
-          q - 1,
-          b,
-          pinY.get(p)!,
-          isTrailing ? daySpan - P[n - 1] : pinY.get(q)!,
-          true,
-          isTrailing ? false : true,
-        );
-        for (let t = p + 1; t <= q - 1; t++) y[t] = seg.y[t - (p + 1)];
-        cost += seg.cost;
-      }
+  for (const blk of stack) {
+    const value = blockValue(blk);
+    let entry = blk.memberHead;
+    while (entry !== null) {
+      const i = entry.index;
+      y[i] = value;
+      cost += Math.abs(value - b[i]);
+      entry = entry.next;
     }
   }
 
   const starts = new Array<number>(n);
   for (let i = 0; i < n; i++) starts[i] = y[i] + P[i];
 
-  // Defensive verification (contract checks; should never fire).
+  // Defensive contract verification.
   for (let i = 0; i < n; i++) {
-    if (!Number.isInteger(starts[i]) || starts[i] < 0 || starts[i] > daySpan) {
-      return { ok: false, reason: 'INFEASIBLE' };
+    if (
+      !Number.isInteger(starts[i]) ||
+      starts[i] < windows[i].low ||
+      starts[i] > windows[i].high
+    ) {
+      return { ok: false, reason: 'INVALID_WINDOW', cueIndex: i };
     }
     if (i > 0 && starts[i] < starts[i - 1] + cues[i - 1].duration) {
-      return { ok: false, reason: 'INFEASIBLE' };
+      return { ok: false, reason: 'INVALID_WINDOW', cueIndex: i };
     }
     if (pinAt[i] !== null && starts[i] !== pinAt[i]) {
-      return { ok: false, reason: 'INFEASIBLE' };
+      return {
+        ok: false,
+        reason: 'INVALID_PIN',
+        cueIndex: i,
+        pinStart: pinAt[i]!,
+      };
     }
   }
 

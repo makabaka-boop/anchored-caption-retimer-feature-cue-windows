@@ -1,5 +1,10 @@
 import { useMemo, useRef, useState } from 'react';
-import { solve, DAY_MS, type Cue } from './solver/solve';
+import {
+  solve,
+  DAY_MS,
+  type Cue,
+  type SolveResult,
+} from './solver/solve';
 import { parseCues, toCuesJson } from './solver/cues';
 import {
   analyzeMaxRetention,
@@ -17,9 +22,9 @@ interface Draft {
 
 type Preview =
   | { kind: 'ready'; starts: number[]; cost: number }
-  | { kind: 'infeasible' };
+  | { kind: 'infeasible'; result: Extract<SolveResult, { ok: false }> };
 
-const ROW_H = 68;
+const ROW_H = 104;
 const LIST_H = 560;
 
 function fmtTime(ms: number): string {
@@ -29,6 +34,31 @@ function fmtTime(ms: number): string {
   const millis = ms % 1000;
   const pad = (v: number, w = 2): string => String(v).padStart(w, '0');
   return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(millis, 3)}`;
+}
+
+function infeasibleMessage(
+  result: Extract<SolveResult, { ok: false }>,
+): string {
+  switch (result.reason) {
+    case 'INVALID_WINDOW':
+      return `INVALID_WINDOW — cue #${result.cueIndex} 的镜头窗口非法，已清空预览。`;
+    case 'INVALID_PIN':
+      return `INVALID_PIN — cue #${result.cueIndex} 的固定点 ${result.pinStart} 超出全天，已清空预览。`;
+    case 'WINDOW_INFEASIBLE': {
+      const c = result.conflict;
+      return `WINDOW_INFEASIBLE — 无固定点仍不可行：cue #${c.cueIndex} 至少需要 ${c.requiredStart} ms，允许上界 ${c.allowedUpperBound} ms。`;
+    }
+    case 'PIN_OUTSIDE_WINDOW': {
+      const c = result.conflict;
+      return `PIN_OUTSIDE_WINDOW — cue #${c.cueIndex} 固定在 ${result.pinStart}，但需 ≥${c.requiredStart}、≤${c.allowedUpperBound}。`;
+    }
+    case 'WINDOW_CHAIN_CONFLICT': {
+      const c = result.conflict;
+      return `WINDOW_CHAIN_CONFLICT — cue #${c.cueIndex} 前序时长传递后至少需要 ${c.requiredStart} ms，但允许上界 ${c.allowedUpperBound} ms${
+        result.pinStart === undefined ? '' : `（相关固定点 ${result.pinStart}）`
+      }。`;
+    }
+  }
 }
 
 /**
@@ -48,6 +78,7 @@ export function CueEditor(): JSX.Element {
     draftRev: 0,
     baseRev: 0,
     pinsRev: 0,
+    windowRev: 0,
   });
   const [plan, setPlan] = useState<RepairPlan | null>(null);
   const [planNotice, setPlanNotice] = useState<string | null>(null);
@@ -57,7 +88,7 @@ export function CueEditor(): JSX.Element {
     const r = solve({ cues: draft.cues, base: draft.base, pins });
     return r.ok
       ? { kind: 'ready', starts: r.starts, cost: r.cost }
-      : { kind: 'infeasible' };
+      : { kind: 'infeasible', result: r };
   }, [draft, pins, importError]);
 
   // Pure analysis: the preview below never touches pins, base or the error.
@@ -67,12 +98,18 @@ export function CueEditor(): JSX.Element {
       draftRev: rev.draftRev,
       baseRev: rev.baseRev,
       pinsRev: rev.pinsRev,
+      windowRev: rev.windowRev,
     });
 
   const importText = (text: string): void => {
     const parsed = parseCues(text);
     // Any import attempt is a revision event: stale plans never apply.
-    setRev((r) => ({ draftRev: r.draftRev + 1, baseRev: 0, pinsRev: 0 }));
+    setRev((r) => ({
+      draftRev: r.draftRev + 1,
+      baseRev: 0,
+      pinsRev: 0,
+      windowRev: 0,
+    }));
     setPlan(null);
     setPlanNotice(null);
     if (!parsed.ok) {
@@ -94,6 +131,56 @@ export function CueEditor(): JSX.Element {
     if (!file) return;
     importText(await file.text());
     if (fileRef.current) fileRef.current.value = '';
+  };
+
+  const parseDayValue = (raw: string): number | null | undefined => {
+    if (raw.trim() === '') return null;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0 || value > DAY_MS) return undefined;
+    return value;
+  };
+
+  // Inline edits use the same strict contract as JSON import: a blank clears
+  // one optional endpoint, but an out-of-day value or an inverted interval is
+  // rejected without touching the current cue/window snapshot.
+  const setWindow = (
+    index: number,
+    side: 'earliest' | 'latest',
+    raw: string,
+  ): void => {
+    if (!draft) return;
+    const parsed = parseDayValue(raw);
+    if (parsed === undefined) return;
+
+    const cue = draft.cues[index];
+    const earliest =
+      side === 'earliest'
+        ? parsed === null
+          ? undefined
+          : parsed
+        : cue.earliest;
+    const latest =
+      side === 'latest'
+        ? parsed === null
+          ? undefined
+          : parsed
+        : cue.latest;
+    const low = earliest === undefined ? 0 : earliest;
+    const high = latest === undefined ? DAY_MS : latest;
+    if (low > high) return;
+
+    const nextCue: Cue = { ...cue };
+    if (earliest === undefined) delete nextCue.earliest;
+    else nextCue.earliest = earliest;
+    if (latest === undefined) delete nextCue.latest;
+    else nextCue.latest = latest;
+
+    const cues = draft.cues.slice();
+    cues[index] = nextCue;
+    setDraft({ cues, base: draft.base });
+    setRev((r) => ({ ...r, windowRev: r.windowRev + 1 }));
+    setPlan(null);
+    setPlanNotice(null);
   };
 
   const setPin = (index: number, raw: string): void => {
@@ -144,11 +231,16 @@ export function CueEditor(): JSX.Element {
     const analysis = analyzeMaxRetention({ cues: draft.cues, pins });
     const built = buildRepairPlan(analysis, rev);
     setPlan(built);
-    setPlanNotice(
-      built === null
-        ? 'P[n−1] 超过全天：无法靠解除固定点恢复，未生成修复方案。'
-        : null,
-    );
+    if (analysis.kind === 'unrecoverable') {
+      const c = analysis.conflict;
+      setPlanNotice(
+        c.cueIndex < 0
+          ? 'WINDOW_INFEASIBLE — 窗口快照本身不可行，解除固定点无法恢复。'
+          : `WINDOW_INFEASIBLE — cue #${c.cueIndex} 至少需要 ${c.requiredStart} ms，但允许上界为 ${c.allowedUpperBound} ms；未生成修复方案。`,
+      );
+    } else {
+      setPlanNotice(null);
+    }
   };
 
   const applyPlan = (): void => {
@@ -156,7 +248,7 @@ export function CueEditor(): JSX.Element {
     const result = applyRepair(plan, rev);
     if (!result.ok) {
       // Stale action: announce expiry without any partial modification.
-      setPlanNotice('修复方案已过期（工作稿、基线或固定点已变更），未做任何修改。');
+      setPlanNotice('修复方案已过期（工作稿、基线、窗口或固定点已变更），未做任何修改。');
       return;
     }
     // One-shot replacement; the next render re-solves against the retained set.
@@ -245,9 +337,7 @@ export function CueEditor(): JSX.Element {
       )}
       {!importError && draft && preview?.kind === 'infeasible' && (
         <div className="banner error">
-          <span>
-            INFEASIBLE — 固定点约束不可行（检查临界冲突的固定点），已清空预览。
-          </span>
+          <span>{infeasibleMessage(preview.result)}</span>
           <button
             type="button"
             className="repair-btn"
@@ -303,7 +393,7 @@ export function CueEditor(): JSX.Element {
       {!draft && !importError && (
         <div className="empty">
           导入根对象仅含 cues 的 JSON（1–20000 项；start 严格递增，duration
-          1–60000，text 1–200 字符）。
+          1–60000，text 1–200 字符；可另加闭区间整数 earliest/latest，旧三字段按全天窗口处理）。
         </div>
       )}
 
@@ -360,6 +450,10 @@ export function CueEditor(): JSX.Element {
                             基线 {fmtTime(base)}
                           </span>
                           <span className="dur">时长 {cue.duration} ms</span>
+                          <span className="window">
+                            窗口 {fmtTime(cue.earliest ?? 0)}–
+                            {fmtTime(cue.latest ?? DAY_MS)}
+                          </span>
                           {newStart !== null && (
                             <span className={delta === 0 ? 'same' : 'shift'}>
                               预览 {fmtTime(newStart)}
@@ -375,6 +469,34 @@ export function CueEditor(): JSX.Element {
                         </div>
                       </div>
                       <div className="lock">
+                        <label>
+                          最早起点
+                          <input
+                            type="number"
+                            min={0}
+                            max={DAY_MS}
+                            step={1}
+                            value={cue.earliest ?? ''}
+                            placeholder="0"
+                            onChange={(e) =>
+                              setWindow(i, 'earliest', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          最晚起点
+                          <input
+                            type="number"
+                            min={0}
+                            max={DAY_MS}
+                            step={1}
+                            value={cue.latest ?? ''}
+                            placeholder={String(DAY_MS)}
+                            onChange={(e) =>
+                              setWindow(i, 'latest', e.target.value)
+                            }
+                          />
+                        </label>
                         <label>
                           固定起点
                           <input

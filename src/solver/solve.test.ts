@@ -20,18 +20,31 @@ interface TinyCase {
   base: number[];
   pins: Map<number, number>;
   U: number;
+  windows?: ReadonlyArray<readonly [number, number]>;
 }
 
-function makeCues(c: Pick<TinyCase, 'durations' | 'base'>): Cue[] {
-  return c.durations.map((d, i) => ({ start: c.base[i], duration: d, text: `c${i}` }));
+function makeCues(
+  c: Pick<TinyCase, 'durations' | 'base'> &
+    Partial<Pick<TinyCase, 'windows' | 'U'>>,
+): Cue[] {
+  return c.durations.map((d, i) => {
+    const w = c.windows?.[i];
+    const cue: Cue = { start: c.base[i], duration: d, text: `c${i}` };
+    if (w && (w[0] !== 0 || w[1] !== c.U)) {
+      if (w[0] !== 0) cue.earliest = w[0];
+      if (w[1] !== c.U) cue.latest = w[1];
+    }
+    return cue;
+  });
 }
 
 /**
  * Exact brute force over all feasible integer start vectors. Feasible
  * envelope in y-space:
  *   -P[i] <= y[i] <= U - (P[n-1] - P[i]), y non-decreasing, pins frozen.
- * Enumerates in ascending order, keeping the first minimum-cost vector, which
- * is the lexicographically smallest optimum.
+ * Enumerates x values in ascending order within each day/window/gap envelope,
+ * keeping the first minimum-cost vector, which is the lexicographically smallest
+ * optimum.
  */
 function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
   const { n, durations, base, pins, U } = c;
@@ -51,7 +64,9 @@ function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
   // Full enumeration (no prefix-cost prune: a pricier prefix can still finish
   // cheaper; ties must be compared lexicographically, which ascending DFS
   // order handles by only accepting a strictly smaller cost).
-  const dfs = (i: number, prev: number, cost: number): void => {
+  const win = (i: number): readonly [number, number] =>
+    c.windows?.[i] ?? [0, U];
+  const dfs = (i: number, prevX: number, cost: number): void => {
     if (i === n) {
       if (cost < state.bestCost) {
         state.best = y.slice();
@@ -59,22 +74,18 @@ function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
       }
       return;
     }
-    // Bounds: under isotonicity the feasible set is exactly the constant
-    // box 0 <= y[i] <= C = U - P[n-1] (y[0] >= 0 forces every value >= 0;
-    // y[n-1] <= C forces every value <= C).
-    const C = U - P[n - 1];
-    let lo = Math.max(0, prev);
-    let hi = C;
+    const [wLo, wHi] = win(i);
     const pin = pins.get(i);
-    if (pin !== undefined) {
-      const v = pin - P[i];
-      if (v < lo || v > hi) return;
-      lo = hi = v;
-    }
-    if (lo > hi) return;
-    for (let v = lo; v <= hi; v++) {
+    const loX = Math.max(wLo, i === 0 ? 0 : prevX + durations[i - 1]);
+    const hiX = wHi;
+    if (pin !== undefined && (pin < loX || pin > hiX)) return;
+    const startX = pin !== undefined ? pin : loX;
+    const endX = pin !== undefined ? pin : hiX;
+    if (startX > endX) return;
+    for (let x = startX; x <= endX; x++) {
+      const v = x - P[i];
       y[i] = v;
-      dfs(i + 1, v, cost + Math.abs(v - b[i]));
+      dfs(i + 1, x, cost + Math.abs(v - b[i]));
     }
   };
   dfs(0, -Infinity, 0);
@@ -263,6 +274,197 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
       expect(actual.cost).toBe(4);
       expect(actual.starts).toEqual([0, 8, 14, 20, 26]);
       expect(actual.starts).toEqual(expected!.starts);
+    }
+  });
+});
+
+describe('window-constrained exhaustive validation', () => {
+  it('seeds all short integer start vectors and pin values with random windows', () => {
+    const rand = rng(20260923);
+    let feasible = 0;
+    let windowInfeasible = 0;
+    let pinOutside = 0;
+    let chainConflict = 0;
+
+    for (let t = 0; t < 1200; t++) {
+      const n = 1 + Math.floor(rand() * 3);
+      const durations = Array.from({ length: n }, () => 1 + Math.floor(rand() * 2));
+      const P: number[] = [0];
+      for (let i = 1; i < n; i++) P[i] = P[i - 1] + durations[i - 1];
+      const U = P[n - 1] + Math.floor(rand() * 6);
+      const windows: Array<[number, number]> = [];
+      for (let i = 0; i < n; i++) {
+        const lo = Math.floor(rand() * (U + 1));
+        const hi = lo + Math.floor(rand() * (U - lo + 1));
+        windows.push([lo, hi]);
+      }
+      const base = Array.from({ length: n }, () => Math.floor(rand() * (U + 1)));
+      const pins = new Map<number, number>();
+      for (let i = 0; i < n; i++) {
+        if (rand() < 0.45) pins.set(i, Math.floor(rand() * (U + 3)) - 1);
+      }
+      const c: TinyCase = { n, durations, base, pins, U, windows };
+      const actual = runSolver(c);
+
+      // Independent forward scan oracle for diagnosis.
+      let invalidPin: { index: number; start: number } | null = null;
+      for (let i = 0; i < n; i++) {
+        const v = pins.get(i);
+        if (v !== undefined && (v < 0 || v > U) && invalidPin === null) {
+          invalidPin = { index: i, start: v };
+        }
+      }
+      if (invalidPin) {
+        expect(actual.ok, `invalid pin ${JSON.stringify(c)}`).toBe(false);
+        if (!actual.ok) {
+          expect(actual.reason).toBe('INVALID_PIN');
+          if (actual.reason === 'INVALID_PIN') {
+            expect(actual.cueIndex).toBe(invalidPin.index);
+            expect(actual.pinStart).toBe(invalidPin.start);
+          }
+        }
+        continue;
+      }
+
+      let required = 0;
+      let windowConflict:
+        | { cueIndex: number; requiredStart: number; allowedUpperBound: number }
+        | null = null;
+      for (let i = 0; i < n; i++) {
+        required = Math.max(required, windows[i][0]);
+        if (required > windows[i][1]) {
+          windowConflict = {
+            cueIndex: i,
+            requiredStart: required,
+            allowedUpperBound: windows[i][1],
+          };
+          break;
+        }
+        required += durations[i];
+      }
+      if (windowConflict) {
+        windowInfeasible++;
+        expect(actual.ok, `window conflict ${JSON.stringify(c)}`).toBe(false);
+        if (!actual.ok) {
+          expect(actual.reason).toBe('WINDOW_INFEASIBLE');
+          if (actual.reason === 'WINDOW_INFEASIBLE') {
+            expect(actual.conflict).toEqual(windowConflict);
+          }
+        }
+        continue;
+      }
+
+      required = 0;
+      let pinConflict:
+        | {
+            reason: 'PIN_OUTSIDE_WINDOW' | 'WINDOW_CHAIN_CONFLICT';
+            cueIndex: number;
+            requiredStart: number;
+            allowedUpperBound: number;
+          }
+        | null = null;
+      for (let i = 0; i < n; i++) {
+        required = Math.max(required, windows[i][0]);
+        const pin = pins.get(i);
+        if (pin !== undefined && (pin < windows[i][0] || pin > windows[i][1])) {
+          pinConflict = {
+            reason: 'PIN_OUTSIDE_WINDOW',
+            cueIndex: i,
+            requiredStart: required,
+            allowedUpperBound: windows[i][1],
+          };
+          break;
+        }
+        if (pin !== undefined ? pin < required : required > windows[i][1]) {
+          pinConflict = {
+            reason: 'WINDOW_CHAIN_CONFLICT',
+            cueIndex: i,
+            requiredStart: required,
+            allowedUpperBound: windows[i][1],
+          };
+          break;
+        }
+        required = pin === undefined ? required + durations[i] : pin + durations[i];
+      }
+      if (pinConflict) {
+        expect(actual.ok, `pin conflict ${JSON.stringify(c)}`).toBe(false);
+        if (!actual.ok) {
+          expect(actual.reason).toBe(pinConflict.reason);
+          if (
+            actual.reason === 'PIN_OUTSIDE_WINDOW' ||
+            actual.reason === 'WINDOW_CHAIN_CONFLICT'
+          ) {
+            expect(actual.conflict.cueIndex).toBe(pinConflict.cueIndex);
+            expect(actual.conflict.requiredStart).toBe(pinConflict.requiredStart);
+            expect(actual.conflict.allowedUpperBound).toBe(
+              pinConflict.allowedUpperBound,
+            );
+          }
+        }
+        if (pinConflict.reason === 'PIN_OUTSIDE_WINDOW') pinOutside++;
+        else chainConflict++;
+        continue;
+      }
+
+      feasible++;
+      const expected = bruteForce(c);
+      expect(expected, `oracle feasibility mismatch ${JSON.stringify(c)}`).not.toBeNull();
+      expect(actual.ok, `unexpected infeasible ${JSON.stringify(c)}`).toBe(true);
+      if (actual.ok && expected) {
+        expect(actual.cost, `cost ${JSON.stringify(c)}`).toBe(expected.cost);
+        expect(actual.starts, `vector ${JSON.stringify(c)}`).toEqual(
+          expected.starts,
+        );
+      }
+    }
+
+    expect(feasible).toBeGreaterThan(200);
+    expect(windowInfeasible).toBeGreaterThan(0);
+    expect(pinOutside).toBeGreaterThan(0);
+    expect(chainConflict).toBeGreaterThan(0);
+  });
+
+  it('distinguishes a raw out-of-window pin from propagated chain failure', () => {
+    const cues: Cue[] = [
+      { start: 0, duration: 10, text: 'a', earliest: 0, latest: 100 },
+      { start: 10, duration: 10, text: 'b', earliest: 50, latest: 60 },
+    ];
+    const self = solve({
+      cues,
+      base: [0, 50],
+      pins: new Map([[1, 70]]),
+    });
+    expect(self.ok).toBe(false);
+    if (!self.ok && self.reason === 'PIN_OUTSIDE_WINDOW') {
+      expect(self.conflict).toEqual({
+        cueIndex: 1,
+        requiredStart: 50,
+        allowedUpperBound: 60,
+      });
+      expect(self.pinStart).toBe(70);
+    }
+
+    const both = solve({
+      cues,
+      base: [0, 50],
+      pins: new Map([[0, 70], [1, 70]]),
+    });
+    expect(both.ok).toBe(false);
+    if (!both.ok) expect(both.reason).toBe('PIN_OUTSIDE_WINDOW');
+
+    const chain = solve({
+      cues,
+      base: [0, 50],
+      pins: new Map([[0, 60], [1, 60]]),
+    });
+    expect(chain.ok).toBe(false);
+    if (!chain.ok && chain.reason === 'WINDOW_CHAIN_CONFLICT') {
+      expect(chain.conflict).toEqual({
+        cueIndex: 1,
+        requiredStart: 70,
+        allowedUpperBound: 60,
+      });
+      expect(chain.pinStart).toBe(60);
     }
   });
 });
@@ -521,12 +723,71 @@ describe('parseCues strict validation', () => {
     expect(parseCues(text).ok).toBe(false);
   });
 
-  it('round-trips through toCuesJson with new starts', () => {
+  it('accepts independently sparse earliest/latest windows and legacy three-field cues', () => {
+    const json = JSON.stringify({
+      cues: [
+        { start: 0, duration: 100, text: 'a', earliest: 2, latest: 90 },
+        { start: 100, duration: 100, text: 'b', earliest: 50 },
+        { start: 200, duration: 100, text: 'c', latest: 500 },
+      ],
+    });
+    const parsed = parseCues(json);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.cues[0]).toEqual({
+        start: 0,
+        duration: 100,
+        text: 'a',
+        earliest: 2,
+        latest: 90,
+      });
+      expect(parsed.cues[1].earliest).toBe(50);
+      expect(parsed.cues[1].latest).toBeUndefined();
+      expect(parsed.cues[2].earliest).toBeUndefined();
+      expect(parsed.cues[2].latest).toBe(500);
+    }
+  });
+
+  it.each([
+    ['earliest non-integer', { start: 0, duration: 1, text: 'a', earliest: 1.5 }],
+    ['latest negative', { start: 0, duration: 1, text: 'a', latest: -1 }],
+    ['latest past day', { start: 0, duration: 1, text: 'a', latest: 86400001 }],
+    ['reversed window', { start: 0, duration: 1, text: 'a', earliest: 3, latest: 2 }],
+  ])('rejects %s', (_name, cue) => {
+    expect(parseCues(JSON.stringify({ cues: [cue] })).ok).toBe(false);
+  });
+
+  it('round-trips adopted results while preserving and omitting sparse windows', () => {
     const parsed = parseCues(valid);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const json = JSON.parse(toCuesJson(parsed.cues, [5, 105]));
     expect(json.cues[0]).toEqual({ start: 5, duration: 100, text: 'a' });
     expect(json.cues[1]).toEqual({ start: 105, duration: 100, text: 'bb' });
+
+    const windowed = parseCues(
+      JSON.stringify({
+        cues: [
+          { start: 0, duration: 100, text: 'a', earliest: 1, latest: 9 },
+          { start: 100, duration: 100, text: 'b', latest: 200 },
+        ],
+      }),
+    );
+    expect(windowed.ok).toBe(true);
+    if (!windowed.ok) return;
+    const out = JSON.parse(toCuesJson(windowed.cues, [2, 105]));
+    expect(out.cues[0]).toEqual({
+      start: 2,
+      duration: 100,
+      text: 'a',
+      earliest: 1,
+      latest: 9,
+    });
+    expect(out.cues[1]).toEqual({
+      start: 105,
+      duration: 100,
+      text: 'b',
+      latest: 200,
+    });
   });
 });
