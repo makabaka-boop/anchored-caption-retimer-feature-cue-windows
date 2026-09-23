@@ -15,9 +15,9 @@ function isInt(v: unknown): v is number {
 
 /**
  * Strict import validation. Root object contains exactly `cues`, an array of
- * 1..20000 cue objects each with exactly integer start/duration and string
- * text; starts are strictly increasing within the day. Any shape deviation is
- * invalid.
+ * 1..20000 cue objects. The old three-field documents remain valid and get the
+ * whole-day window. New documents may add integer earliest/latest independently;
+ * ranges, reversed windows or unknown fields reject the whole modification.
  */
 export function parseCues(text: string): ParseCuesResult {
   let data: unknown;
@@ -44,8 +44,19 @@ export function parseCues(text: string): ParseCuesResult {
       return { ok: false };
     }
     const obj = item as Record<string, unknown>;
-    if (Object.keys(obj).length !== 3) return { ok: false };
-    const { start, duration, text: cueText } = obj;
+    const keys = Object.keys(obj);
+    const required = ['start', 'duration', 'text'];
+    const optional = ['earliest', 'latest'];
+    const allowed = new Set([...required, ...optional]);
+    if (
+      keys.length < 3 ||
+      keys.length > 5 ||
+      required.some((key) => !Object.prototype.hasOwnProperty.call(obj, key)) ||
+      keys.some((key) => !allowed.has(key))
+    ) {
+      return { ok: false };
+    }
+    const { start, duration, text: cueText, earliest, latest } = obj;
     if (!isInt(start) || start < 0 || start > MAX_START) return { ok: false };
     if (!isInt(duration) || duration < 1 || duration > MAX_DURATION) {
       return { ok: false };
@@ -53,18 +64,43 @@ export function parseCues(text: string): ParseCuesResult {
     if (typeof cueText !== 'string' || cueText.length < 1 || cueText.length > MAX_TEXT) {
       return { ok: false };
     }
+
+    const cue: Cue = { start, duration, text: cueText };
+    if (earliest !== undefined) {
+      if (!isInt(earliest) || earliest < 0 || earliest > MAX_START) {
+        return { ok: false };
+      }
+      cue.earliest = earliest;
+    }
+    if (latest !== undefined) {
+      if (!isInt(latest) || latest < 0 || latest > MAX_START) {
+        return { ok: false };
+      }
+      cue.latest = latest;
+    }
+    const lo = cue.earliest ?? 0;
+    const hi = cue.latest ?? MAX_START;
+    if (lo > hi) return { ok: false };
+
     if (start <= prev) return { ok: false }; // strictly increasing
     prev = start;
-    cues[i] = { start, duration, text: cueText };
+    cues[i] = cue;
   }
   return { ok: true, cues };
 }
 
 export function toCuesJson(cues: ReadonlyArray<Cue>, starts: ReadonlyArray<number>): string {
-  const out = cues.map((c, i) => ({
-    start: starts[i],
-    duration: c.duration,
-    text: c.text,
-  }));
+  const out = cues.map((c, i) => {
+    const item: Cue = {
+      start: starts[i],
+      duration: c.duration,
+      text: c.text,
+    };
+    // Preserve explicit optional window boundaries; absent boundaries remain
+    // absent so old three-field output is produced for old input.
+    if (c.earliest !== undefined) item.earliest = c.earliest;
+    if (c.latest !== undefined) item.latest = c.latest;
+    return item;
+  });
   return JSON.stringify({ cues: out });
 }

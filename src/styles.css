@@ -252,6 +252,10 @@ header h1 {
   color: #1d6b30;
 }
 
+.window {
+  color: #6b5da8;
+}
+
 .lock {
   flex: 0 0 auto;
   display: flex;
@@ -268,11 +272,16 @@ header h1 {
 }
 
 .lock input {
-  width: 130px;
+  width: 112px;
   padding: 4px 6px;
   border: 1px solid #c3c8d2;
   border-radius: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.lock input.invalid {
+  border-color: #b01f24;
+  background: #fff3f3;
 }
 
 .lock button {

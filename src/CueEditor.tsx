@@ -1,5 +1,11 @@
 import { useMemo, useRef, useState } from 'react';
-import { solve, DAY_MS, type Cue } from './solver/solve';
+import {
+  solve,
+  DAY_MS,
+  cueWindow,
+  type Cue,
+  type InfeasibleResult,
+} from './solver/solve';
 import { parseCues, toCuesJson } from './solver/cues';
 import {
   analyzeMaxRetention,
@@ -17,9 +23,9 @@ interface Draft {
 
 type Preview =
   | { kind: 'ready'; starts: number[]; cost: number }
-  | { kind: 'infeasible' };
+  | { kind: 'infeasible'; result: InfeasibleResult };
 
-const ROW_H = 68;
+const ROW_H = 78;
 const LIST_H = 560;
 
 function fmtTime(ms: number): string {
@@ -29,6 +35,22 @@ function fmtTime(ms: number): string {
   const millis = ms % 1000;
   const pad = (v: number, w = 2): string => String(v).padStart(w, '0');
   return `${pad(h)}:${pad(m)}:${pad(s)}.${pad(millis, 3)}`;
+}
+
+function conflictText(result: InfeasibleResult): string {
+  if (result.reason === 'PIN_OUTSIDE_WINDOW') {
+    return `固定点落在自身窗口外 · cue #${result.conflictIndex}：固定起点 ${result.requiredStart}，允许闭区间 [${result.allowedEarliest}, ${result.allowedLatest}]。`;
+  }
+  if (result.reason === 'WINDOW_CHAIN') {
+    return `窗口链冲突 · 最早 cue #${result.conflictIndex}：前序时长要求起点至少 ${result.requiredStart}，允许上界 ${result.allowedLatest}。`;
+  }
+  if (result.reason === 'INVALID_WINDOW') {
+    return `WINDOW_INVALID · cue #${result.conflictIndex ?? '?'} 的窗口缺失、越界或反序。`;
+  }
+  if (result.reason === 'INVALID_PIN') {
+    return `PIN_INVALID · cue #${result.conflictIndex ?? '?'} 的固定点无效。`;
+  }
+  return 'INFEASIBLE — 固定点与窗口约束不可行。';
 }
 
 /**
@@ -41,13 +63,19 @@ export function CueEditor(): JSX.Element {
   const [importError, setImportError] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
+  const [windowError, setWindowError] = useState<{
+    index: number;
+    field: 'earliest' | 'latest';
+    message: string;
+  } | null>(null);
 
-  // Revision identities: every import, adoption or pin add/remove/edit bumps a
-  // revision, immediately invalidating any repair plan generated earlier.
+  // Revision identities: every import, adoption, pin change or accepted window
+  // edit bumps the relevant revision, immediately invalidating an older plan.
   const [rev, setRev] = useState<RevisionId>({
     draftRev: 0,
     baseRev: 0,
     pinsRev: 0,
+    windowsRev: 0,
   });
   const [plan, setPlan] = useState<RepairPlan | null>(null);
   const [planNotice, setPlanNotice] = useState<string | null>(null);
@@ -57,7 +85,7 @@ export function CueEditor(): JSX.Element {
     const r = solve({ cues: draft.cues, base: draft.base, pins });
     return r.ok
       ? { kind: 'ready', starts: r.starts, cost: r.cost }
-      : { kind: 'infeasible' };
+      : { kind: 'infeasible', result: r };
   }, [draft, pins, importError]);
 
   // Pure analysis: the preview below never touches pins, base or the error.
@@ -67,22 +95,28 @@ export function CueEditor(): JSX.Element {
       draftRev: rev.draftRev,
       baseRev: rev.baseRev,
       pinsRev: rev.pinsRev,
+      windowsRev: rev.windowsRev,
     });
 
   const importText = (text: string): void => {
     const parsed = parseCues(text);
-    // Any import attempt is a revision event: stale plans never apply.
-    setRev((r) => ({ draftRev: r.draftRev + 1, baseRev: 0, pinsRev: 0 }));
-    setPlan(null);
-    setPlanNotice(null);
     if (!parsed.ok) {
-      // Illegal import: drop the current preview, keep the last legal draft
-      // and its pins untouched.
+      // Illegal import: drop the current preview, keep the last legal draft,
+      // pins, windows and repair state untouched.
       setImportError(true);
       return;
     }
+    setRev((r) => ({
+      draftRev: r.draftRev + 1,
+      baseRev: 0,
+      pinsRev: 0,
+      windowsRev: r.windowsRev + 1,
+    }));
+    setPlan(null);
+    setPlanNotice(null);
     setImportError(false);
     setPins(new Map());
+    setWindowError(null);
     setScrollTop(0);
     setDraft({
       cues: parsed.cues,
@@ -138,17 +172,92 @@ export function CueEditor(): JSX.Element {
     bumpPins();
   };
 
+  const editWindow = (
+    index: number,
+    field: 'earliest' | 'latest',
+    raw: string,
+  ): void => {
+    if (!draft) return;
+    const cue = draft.cues[index];
+    const current = cueWindow(cue, DAY_MS);
+    if (raw.trim() === '') {
+      if (cue[field] === undefined) {
+        setWindowError(null);
+        return;
+      }
+      const target: Cue = {
+        ...cue,
+        earliest: field === 'earliest' ? undefined : cue.earliest,
+        latest: field === 'latest' ? undefined : cue.latest,
+      };
+      commitWindow(index, target);
+      return;
+    }
+
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0 || value > DAY_MS) {
+      setWindowError({
+        index,
+        field,
+        message: '窗口边界必须是 0–86,400,000 内的整数。',
+      });
+      return;
+    }
+    if (cue[field] === value) {
+      setWindowError(null);
+      return;
+    }
+
+    const earliest = field === 'earliest' ? value : current.earliest;
+    const latest = field === 'latest' ? value : current.latest;
+    if (earliest > latest) {
+      setWindowError({
+        index,
+        field,
+        message: '窗口反序：earliest 不能晚于 latest；本次修改已拒绝。',
+      });
+      return;
+    }
+
+    const target: Cue = {
+      ...draft.cues[index],
+      earliest: field === 'earliest' ? value : draft.cues[index].earliest,
+      latest: field === 'latest' ? value : draft.cues[index].latest,
+    };
+    commitWindow(index, target);
+  };
+
+  const commitWindow = (index: number, cue: Cue): void => {
+    if (!draft) return;
+    const cues = draft.cues.slice();
+    cues[index] = cue;
+    setDraft({ cues, base: draft.base });
+    setWindowError(null);
+    setRev((r) => ({ ...r, draftRev: r.draftRev + 1, windowsRev: r.windowsRev + 1 }));
+    setPlan(null);
+    setPlanNotice(null);
+  };
+
   // Pure maximum-retention analysis; pins/base/current error stay untouched.
   const generateRepair = (): void => {
     if (!draft || preview?.kind !== 'infeasible') return;
     const analysis = analyzeMaxRetention({ cues: draft.cues, pins });
     const built = buildRepairPlan(analysis, rev);
     setPlan(built);
-    setPlanNotice(
-      built === null
-        ? 'P[n−1] 超过全天：无法靠解除固定点恢复，未生成修复方案。'
-        : null,
-    );
+    if (built !== null) {
+      setPlanNotice(null);
+    } else if (analysis.kind === 'unrecoverable' && analysis.reason === 'WINDOWS_INFEASIBLE') {
+      const at = analysis.conflictIndex;
+      setPlanNotice(
+        at === undefined
+          ? '当前窗口本身不可行：解除固定点无法恢复，未生成修复方案。'
+          : `窗口链在 cue #${at} 冲突：所需起点 ${analysis.requiredStart}，允许上界 ${analysis.allowedLatest}；解除固定点无法恢复。`,
+      );
+    } else if (analysis.kind === 'unrecoverable' && analysis.reason === 'INVALID_WINDOW') {
+      setPlanNotice(`cue #${analysis.conflictIndex ?? '?'} 的窗口无效，未生成修复方案。`);
+    } else {
+      setPlanNotice('P[n−1] 超过全天：无法靠解除固定点恢复，未生成修复方案。');
+    }
   };
 
   const applyPlan = (): void => {
@@ -243,11 +352,16 @@ export function CueEditor(): JSX.Element {
           INVALID_CUES — 导入非法，已清空预览；下方保留最近一次合法工作稿。
         </div>
       )}
-      {!importError && draft && preview?.kind === 'infeasible' && (
+      {!importError && draft && windowError && (
         <div className="banner error">
           <span>
-            INFEASIBLE — 固定点约束不可行（检查临界冲突的固定点），已清空预览。
+            WINDOW_REJECTED · cue #{windowError.index} {windowError.message}
           </span>
+        </div>
+      )}
+      {!importError && draft && preview?.kind === 'infeasible' && (
+        <div className="banner error">
+          <span>{conflictText(preview.result)}</span>
           <button
             type="button"
             className="repair-btn"
@@ -303,7 +417,7 @@ export function CueEditor(): JSX.Element {
       {!draft && !importError && (
         <div className="empty">
           导入根对象仅含 cues 的 JSON（1–20000 项；start 严格递增，duration
-          1–60000，text 1–200 字符）。
+          1–60000，text 1–200 字符；可选整数 earliest/latest 闭区间）。
         </div>
       )}
 
@@ -337,6 +451,10 @@ export function CueEditor(): JSX.Element {
                   const overlapPrev =
                     i > 0 &&
                     base < draft.base[i - 1] + draft.cues[i - 1].duration;
+                  const win = cueWindow(cue, DAY_MS);
+                  const outOfWindow =
+                    newStart !== null &&
+                    (newStart < win.earliest || newStart > win.latest);
                   return (
                     <div
                       key={i}
@@ -360,6 +478,9 @@ export function CueEditor(): JSX.Element {
                             基线 {fmtTime(base)}
                           </span>
                           <span className="dur">时长 {cue.duration} ms</span>
+                          <span className={outOfWindow ? 'bad' : 'window'}>
+                            窗口 [{fmtTime(win.earliest)}, {fmtTime(win.latest)}]
+                          </span>
                           {newStart !== null && (
                             <span className={delta === 0 ? 'same' : 'shift'}>
                               预览 {fmtTime(newStart)}
@@ -385,6 +506,48 @@ export function CueEditor(): JSX.Element {
                             value={pinned ? pinValue : ''}
                             placeholder="—"
                             onChange={(e) => setPin(i, e.target.value)}
+                          />
+                        </label>
+                        <label>
+                          earliest
+                          <input
+                            key={`e-${rev.draftRev}-${cue.earliest ?? ''}`}
+                            className={
+                              windowError?.index === i &&
+                              windowError.field === 'earliest'
+                                ? 'invalid'
+                                : ''
+                            }
+                            type="number"
+                            min={0}
+                            max={DAY_MS}
+                            step={1}
+                            defaultValue={cue.earliest ?? ''}
+                            placeholder="0"
+                            onChange={(e) =>
+                              editWindow(i, 'earliest', e.target.value)
+                            }
+                          />
+                        </label>
+                        <label>
+                          latest
+                          <input
+                            key={`l-${rev.draftRev}-${cue.latest ?? ''}`}
+                            className={
+                              windowError?.index === i &&
+                              windowError.field === 'latest'
+                                ? 'invalid'
+                                : ''
+                            }
+                            type="number"
+                            min={0}
+                            max={DAY_MS}
+                            step={1}
+                            defaultValue={cue.latest ?? ''}
+                            placeholder={String(DAY_MS)}
+                            onChange={(e) =>
+                              editWindow(i, 'latest', e.target.value)
+                            }
                           />
                         </label>
                         <button

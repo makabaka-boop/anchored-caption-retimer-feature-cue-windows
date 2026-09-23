@@ -12,11 +12,17 @@ import {
   type RevisionId,
 } from './repair';
 
-function makeCues(durations: number[]): Cue[] {
+interface WindowSpec {
+  earliest?: number;
+  latest?: number;
+}
+
+function makeCues(durations: number[], windows: WindowSpec[] = []): Cue[] {
   return durations.map((d, i) => ({
     start: durations.slice(0, i).reduce((a, b) => a + b, 0),
     duration: d,
     text: `c${i}`,
+    ...(windows[i] ?? {}),
   }));
 }
 
@@ -52,16 +58,33 @@ function bruteMaxRetention(
   durations: number[],
   pins: Map<number, number>,
   U: number,
+  windows: WindowSpec[] = [],
 ): BruteResult | null {
   const P = prefixes(durations);
-  const C = U - P[durations.length - 1];
+  const n = durations.length;
+  const C = U - P[n - 1];
   if (C < 0) return null;
+
+  const A = new Array<number>(n).fill(0);
+  const B = new Array<number>(n).fill(C);
+  for (let i = 0; i < n; i++) {
+    A[i] = Math.max(i ? A[i - 1] : 0, (windows[i]?.earliest ?? 0) - P[i]);
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    B[i] = Math.min(i === n - 1 ? C : B[i + 1], (windows[i]?.latest ?? U) - P[i]);
+  }
+  if (A.some((v, i) => v > B[i])) return null;
 
   const mandatory: number[] = [];
   const valid: Array<{ idx: number; start: number; y: number }> = [];
   for (const [idx, start] of pins) {
+    const inWindow =
+      idx >= 0 &&
+      idx < n &&
+      start >= (windows[idx]?.earliest ?? 0) &&
+      start <= (windows[idx]?.latest ?? U);
     const y = start - P[idx];
-    if (y < 0 || y > C) mandatory.push(idx);
+    if (!inWindow || y < A[idx] || y > B[idx]) mandatory.push(idx);
     else valid.push({ idx, start, y });
   }
   mandatory.sort((a, b) => a - b);
@@ -199,6 +222,132 @@ describe('max-retention repair — pure analysis contract', () => {
     expect(cases).toBeGreaterThan(3_000);
   });
 
+  it('enumerates every pin subset under window snapshots (n <= 2)', () => {
+    const cart = <T,>(sets: T[][]): T[][] =>
+      sets.reduce<T[][]>(
+        (acc, s) => acc.flatMap((prefix) => s.map((v) => [...prefix, v])),
+        [[]],
+      );
+    const range = (m: number): number[] =>
+      Array.from({ length: m }, (_, i) => i + 1);
+
+    let cases = 0;
+    for (const n of [1, 2]) {
+      const durGrids = cart(range(n).map(() => [1, 2]));
+      for (const durations of durGrids) {
+        const P = prefixes(durations);
+        for (const U of [P[n - 1], P[n - 1] + 3]) {
+          const perCueOptions: WindowSpec[][] = range(n).map((_, i) => [
+            {},
+            { earliest: 0 },
+            { earliest: Math.max(0, P[i] - 1) },
+            { earliest: P[i] },
+            { latest: U },
+            { latest: Math.min(U, P[i] + 1) },
+            { earliest: P[i], latest: U },
+          ]);
+          const windowRows: WindowSpec[][] = cart(perCueOptions).filter((row) =>
+            row.every((w) => (w.earliest ?? 0) <= (w.latest ?? U)),
+          );
+
+          for (const windows of windowRows) {
+            const choices: Array<null | number>[] = range(n).map(() => [
+              null,
+              ...range(U + 1).map((v) => v),
+            ]);
+            for (const combo of cart(choices).slice(0, 64)) {
+              const pins = new Map<number, number>();
+              combo.forEach((start, i) => {
+                if (start !== null) pins.set(i, start);
+              });
+              const expected = bruteMaxRetention(durations, pins, U, windows);
+              const actual = analyzeMaxRetentionWithSpan(
+                makeCues(durations, windows),
+                pins,
+                U,
+              );
+              if (expected === null) {
+                expect(actual.kind).toBe('unrecoverable');
+                if (actual.kind === 'unrecoverable') {
+                  expect(actual.reason).toBe('WINDOWS_INFEASIBLE');
+                }
+              } else {
+                expectDetail(actual);
+                expect(actual.retainedCount, `${JSON.stringify({ durations, U, windows, pins })}`).toBe(
+                  expected.retainedCount,
+                );
+                expect(actual.retained).toEqual(expected.retained);
+                expect(actual.released).toEqual(expected.released);
+                expect(actual.mandatoryReleased).toEqual(
+                  expected.mandatoryReleased,
+                );
+                const r = solveWithSpan(
+                  makeCues(durations, windows),
+                  makeCues(durations, windows).map((c) => c.start),
+                  actual.retainedPins,
+                  U,
+                );
+                expect(r.ok, `retained set infeasible: ${JSON.stringify(actual)}`).toBe(true);
+              }
+              cases++;
+            }
+          }
+        }
+      }
+    }
+    expect(cases).toBeGreaterThan(1000);
+  });
+
+  it('random windowed n <= 4 cases agree with the subset oracle', () => {
+    let seed = 0x1234abcd;
+    const rand = (): number => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    for (let trial = 0; trial < 300; trial++) {
+      const n = 1 + Math.floor(rand() * 4);
+      const durations = Array.from({ length: n }, () => 1 + Math.floor(rand() * 3));
+      const P = prefixes(durations);
+      const U = P[n - 1] + Math.floor(rand() * 6);
+      const windows: WindowSpec[] = Array.from({ length: n }, () => {
+        const w: WindowSpec = {};
+        if (rand() < 0.7) w.earliest = Math.min(U, Math.floor(rand() * (U + 1)));
+        if (rand() < 0.7) w.latest = Math.min(U, Math.floor(rand() * (U + 1)));
+        if (
+          w.earliest !== undefined &&
+          w.latest !== undefined &&
+          w.earliest > w.latest
+        ) {
+          return { earliest: w.latest, latest: w.earliest };
+        }
+        return w;
+      });
+      const pins = new Map<number, number>();
+      for (let i = 0; i < n; i++) {
+        if (rand() < 0.75) pins.set(i, Math.floor(rand() * (U + 2)) - 1);
+      }
+
+      const expected = bruteMaxRetention(durations, pins, U, windows);
+      const actual = analyzeMaxRetentionWithSpan(makeCues(durations, windows), pins, U);
+      if (expected === null) {
+        expect(actual.kind, `trial ${trial}`).toBe('unrecoverable');
+      } else {
+        expectDetail(actual);
+        expect(actual.retainedCount, `trial ${trial}: ${JSON.stringify({ durations, U, windows, pins })}`).toBe(
+          expected.retainedCount,
+        );
+        expect(actual.retained, `trial ${trial}`).toEqual(expected.retained);
+        expect(actual.released, `trial ${trial}`).toEqual(expected.released);
+        expect(actual.mandatoryReleased, `trial ${trial}`).toEqual(
+          expected.mandatoryReleased,
+        );
+      }
+    }
+  });
+
   it('transformed values [5,1,4] release the first item', () => {
     // P = [0,1,2]; pinned transformed coordinates y = 5,1,4 with C = 10.
     const durations = [1, 1, 1];
@@ -214,6 +363,42 @@ describe('max-retention repair — pure analysis contract', () => {
     expect(a.retained).toEqual([1, 2]);
     expect(a.released).toEqual([0]);
     expect(a.mandatoryReleased).toEqual([]);
+  });
+
+  it('windows themselves are checked before generating a pin repair', () => {
+    const durations = [5, 5, 5];
+    const U = 20;
+    const windows: WindowSpec[] = [
+      { earliest: 0, latest: 0 },
+      { earliest: 16, latest: 20 },
+      { earliest: 0, latest: 20 },
+    ];
+    const pins = new Map<number, number>([[2, 10]]);
+    const a = analyzeMaxRetentionWithSpan(makeCues(durations, windows), pins, U);
+    expect(a.kind).toBe('unrecoverable');
+    if (a.kind === 'unrecoverable') {
+      expect(a.reason).toBe('WINDOWS_INFEASIBLE');
+      expect(a.conflictIndex).toBe(1);
+      expect(a.requiredStart).toBe(16);
+      expect(a.allowedLatest).toBe(15);
+      expect(buildRepairPlan(a, { draftRev: 1, baseRev: 0, pinsRev: 0, windowsRev: 0 })).toBe(null);
+    }
+  });
+
+  it('a pin in its own window can still be mandatory under a prior window envelope', () => {
+    const durations = [5, 5, 5];
+    const U = 30;
+    const windows: WindowSpec[] = [
+      { earliest: 10, latest: 10 },
+      {},
+      {},
+    ];
+    const pins = new Map<number, number>([[2, 11]]); // own day-wide window, but y=1 < A[2]=10
+    const a = analyzeMaxRetentionWithSpan(makeCues(durations, windows), pins, U);
+    expectDetail(a);
+    expect(a.mandatoryReleased).toEqual([2]);
+    expect(a.retainedCount).toBe(0);
+    expect(a.released).toEqual([2]);
   });
 
   it('tie: [2,1,2] keeps the lexicographically largest retained set', () => {
@@ -284,7 +469,7 @@ describe('max-retention repair — pure analysis contract', () => {
     const pins = new Map<number, number>([[0, 0]]);
     const a = analyzeMaxRetentionWithSpan(makeCues(durations), pins, 7);
     expect(a.kind).toBe('unrecoverable');
-    expect(buildRepairPlan(a, { draftRev: 1, baseRev: 0, pinsRev: 0 })).toBe(
+    expect(buildRepairPlan(a, { draftRev: 1, baseRev: 0, pinsRev: 0, windowsRev: 0 })).toBe(
       null,
     );
   });
@@ -398,7 +583,7 @@ describe('max-retention repair — pure analysis contract', () => {
 });
 
 describe('repair plans: identities, expiry and atomic apply', () => {
-  const id: RevisionId = { draftRev: 1, baseRev: 2, pinsRev: 3 };
+  const id: RevisionId = { draftRev: 1, baseRev: 2, pinsRev: 3, windowsRev: 4 };
 
   it('carries the draft/base/pins revisions it was generated with', () => {
     const a = analyzeMaxRetentionWithSpan(
@@ -416,6 +601,7 @@ describe('repair plans: identities, expiry and atomic apply', () => {
       draftRev: 1,
       baseRev: 2,
       pinsRev: 3,
+      windowsRev: 4,
       retainedCount: 2,
       released: [0],
     });
@@ -461,7 +647,7 @@ describe('repair plans: identities, expiry and atomic apply', () => {
     }
   });
 
-  it('expires on draft or baseline revisions too', () => {
+  it('expires on draft, baseline or window revisions too', () => {
     const a = analyzeMaxRetentionWithSpan(
       makeCues([1, 1]),
       new Map<number, number>([
@@ -473,6 +659,7 @@ describe('repair plans: identities, expiry and atomic apply', () => {
     const plan = buildRepairPlan(a, id)!;
     expect(applyRepair(plan, { ...id, draftRev: 9 }).ok).toBe(false);
     expect(applyRepair(plan, { ...id, baseRev: 9 }).ok).toBe(false);
+    expect(applyRepair(plan, { ...id, windowsRev: 9 }).ok).toBe(false);
     expect(applyRepair(plan, id).ok).toBe(true);
   });
 
@@ -524,7 +711,7 @@ describe('max-retention repair — 20000 adversarial pins', () => {
     expect(a.released.length).toBe(n - 1);
     expect(a.mandatoryReleased.length).toBe(0);
 
-    const id: RevisionId = { draftRev: 1, baseRev: 0, pinsRev: 0 };
+    const id: RevisionId = { draftRev: 1, baseRev: 0, pinsRev: 0, windowsRev: 0 };
     const plan = buildRepairPlan(a, id)!;
     const applied = applyRepair(plan, id);
     expect(applied.ok).toBe(true);
@@ -574,9 +761,10 @@ describe('max-retention repair — 20000 adversarial pins', () => {
     ys[n - 1] = 1;
     const pins = new Map<number, number>();
     for (let i = 0; i < n; i++) pins.set(i, P[i] + ys[i]);
+    const cues = makeCues(durations);
 
     const t0 = performance.now();
-    const a = analyzeMaxRetentionWithSpan(makeCues(durations), pins, U);
+    const a = analyzeMaxRetentionWithSpan(cues, pins, U);
     expect(performance.now() - t0).toBeLessThan(2_000);
     expectDetail(a);
 
@@ -598,8 +786,8 @@ describe('max-retention repair — 20000 adversarial pins', () => {
     // lexicographically largest retained indices.
     expect(a.retained).toEqual([n - 2, n - 1]);
     const r = solveWithSpan(
-      makeCues(durations),
-      makeCues(durations).map((c) => c.start),
+      cues,
+      cues.map((c) => c.start),
       a.retainedPins,
       U,
     );
@@ -614,16 +802,17 @@ describe('max-retention repair — 20000 adversarial pins', () => {
     // Only four distinct y values repeating: stresses the grouped activation
     // and per-group point maxima with 20000 members spread over four leaves.
     for (let i = 0; i < n; i++) pins.set(i, P[i] + (i % 4));
+    const cues = makeCues(durations);
     const t0 = performance.now();
-    const a = analyzeMaxRetentionWithSpan(makeCues(durations), pins, U);
+    const a = analyzeMaxRetentionWithSpan(cues, pins, U);
     expect(performance.now() - t0).toBeLessThan(2_000);
     expectDetail(a);
     // Pattern 0,1,2,3 repeating: 5000 complete blocks then a 0,1,2 tail;
     // the LNDS takes one block plus the tail: 4 + 3 = 5003.
     expect(a.retainedCount).toBe(5003);
     const r2 = solveWithSpan(
-      makeCues(durations),
-      makeCues(durations).map((c) => c.start),
+      cues,
+      cues.map((c) => c.start),
       a.retainedPins,
       U,
     );

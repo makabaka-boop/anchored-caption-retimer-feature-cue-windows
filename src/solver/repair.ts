@@ -1,24 +1,24 @@
-// Maximum-retention repair for infeasible pin sets.
+// Maximum-retention repair for infeasible pin/window instances.
 //
-// When solve() reports INFEASIBLE the operator may release fixed points. This
-// module is a *pure analysis layer*: it never mutates the working draft, the
-// baseline, the pin map or the current error, and it never calls solve() (in
-// particular it does not repeatedly delete a conflicting pin and re-solve).
+// When solve() reports infeasibility the operator may release fixed points.
+// This module is a *pure analysis layer*: it never mutates the working draft,
+// baseline, pin map or windows, never calls solve(), and in particular does not
+// repeatedly delete a conflicting pin and re-solve.
 //
 // Geometry. With P[i] = sum_{k<i} duration[k] and y = pinStart - P[cueIndex],
-// a pin set is jointly feasible iff every pin satisfies
-//   0 <= y <= C,  C = daySpan - P[n-1]
-// and the y values are non-decreasing in cue-index order. If P[n-1] > daySpan
-// the cues cannot fit even with no pins, so no repair exists.
+// feasible cue starts correspond to a non-decreasing y. The start/end-of-day
+// envelope gives 0 <= y <= C, C = daySpan - P[n-1]. A pin can be part of a
+// joint solution only when it is inside that pin's own [earliest,latest]
+// window and the global envelope. After mandatory releases, the largest
+// jointly feasible set is a longest non-decreasing subsequence (LNDS) of y.
 //
-// Pins outside the constant box are mandatory releases. Among the remaining
-// pins the largest jointly feasible set is a longest non-decreasing subsequence
-// (LNDS) of y. Ties are broken by the full release list (mandatory releases
-// included, cue indices ascending) being lexicographically smallest, which is
-// equivalent to choosing the lexicographically largest retained index set.
+// Ties are broken by the complete release list (mandatory releases included,
+// cue indices ascending) being lexicographically smallest, equivalent to the
+// lexicographically largest retained index set.
 //
-// Complexity is O(k log k) time and O(k) space for k pins (plus the O(n)
-// prefix-duration scan): two tails passes plus one per-group segment tree.
+// If the windows themselves admit no pin-free solution, releasing pins cannot
+// help and no repair plan is generated. Complexity is O(k log k) time and
+// O(k) space for k pins, plus an O(n) window scan.
 
 import type { Cue, Pins } from './solve';
 
@@ -31,7 +31,7 @@ export interface RepairInput {
 
 export interface RepairDetail {
   kind: 'repair';
-  /** Pins that violate the per-index envelope 0 <= y <= C (or are malformed). */
+  /** Pins outside their own window or the global duration envelope. */
   mandatoryReleased: number[];
   /** Cue indices kept, ascending — the chosen maximum-cardinality subset. */
   retained: number[];
@@ -45,13 +45,24 @@ export interface RepairDetail {
 
 export type RepairAnalysis =
   | RepairDetail
-  | { kind: 'unrecoverable' };
+  | {
+      kind: 'unrecoverable';
+      reason:
+        | 'WINDOWS_INFEASIBLE'
+        | 'TOO_LONG'
+        | 'INVALID_WINDOW'
+        | 'INVALID_PIN';
+      conflictIndex?: number;
+      requiredStart?: number;
+      allowedLatest?: number;
+    };
 
 /** Revision identities of the state a repair plan was generated against. */
 export interface RevisionId {
   draftRev: number;
   baseRev: number;
   pinsRev: number;
+  windowsRev: number;
 }
 
 export interface RepairPlan extends RevisionId {
@@ -70,7 +81,8 @@ export function sameRevision(a: RevisionId, b: RevisionId): boolean {
   return (
     a.draftRev === b.draftRev &&
     a.baseRev === b.baseRev &&
-    a.pinsRev === b.pinsRev
+    a.pinsRev === b.pinsRev &&
+    a.windowsRev === b.windowsRev
   );
 }
 
@@ -118,6 +130,100 @@ class SegMaxRange {
   }
 }
 
+interface WindowEnvelope {
+  prefix: number[];
+  /** Tightest upper bound at i implied by i and every later window/day edge. */
+  suffixUpper: number[];
+  /** P[n-1]: duration consumed before the last start (the final duration need not fit past day end). */
+  chainDuration: number;
+  globalSlack: number;
+  malformedIndex: number | null;
+}
+
+function windowOf(cue: Cue, daySpan: number): { earliest: number; latest: number } {
+  return { earliest: cue.earliest ?? 0, latest: cue.latest ?? daySpan };
+}
+
+function buildEnvelope(
+  cues: ReadonlyArray<Cue>,
+  daySpan: number,
+): WindowEnvelope | null {
+  const n = cues.length;
+  const prefix = new Array<number>(n);
+  let malformedIndex: number | null = null;
+  if (n === 0) {
+    return {
+      prefix,
+      suffixUpper: [],
+      chainDuration: 0,
+      globalSlack: daySpan,
+      malformedIndex: null,
+    };
+  }
+
+  prefix[0] = 0;
+  for (let i = 0; i + 1 < n; i++) prefix[i + 1] = prefix[i] + cues[i].duration;
+  const chainDuration = prefix[n - 1];
+  if (chainDuration > daySpan) return null;
+
+  const suffixUpper = new Array<number>(n);
+  for (let i = n - 1; i >= 0; i--) {
+    const w = windowOf(cues[i], daySpan);
+    if (
+      malformedIndex === null &&
+      (!Number.isInteger(w.earliest) ||
+        !Number.isInteger(w.latest) ||
+        w.earliest < 0 ||
+        w.latest < 0 ||
+        w.earliest > daySpan ||
+        w.latest > daySpan ||
+        w.earliest > w.latest)
+    ) {
+      malformedIndex = i;
+    }
+    const safeLatest = Number.isInteger(w.latest)
+      ? Math.max(0, Math.min(w.latest, daySpan))
+      : 0;
+    const own = Math.min(safeLatest, daySpan - (chainDuration - prefix[i]));
+    suffixUpper[i] =
+      i + 1 < n
+        ? Math.min(own, suffixUpper[i + 1] - cues[i].duration)
+        : own;
+  }
+
+  return {
+    prefix,
+    suffixUpper,
+    chainDuration,
+    globalSlack: daySpan - chainDuration,
+    malformedIndex,
+  };
+}
+
+interface WindowConflict {
+  conflictIndex: number;
+  requiredStart: number;
+  allowedLatest: number;
+}
+
+/** Feasibility of the windows with no pins; same x-space envelope as solve(). */
+function windowConflict(
+  cues: ReadonlyArray<Cue>,
+  env: WindowEnvelope,
+): WindowConflict | null {
+  const n = cues.length;
+  let required = 0;
+  for (let i = 0; i < n; i++) {
+    const lower = Math.max(required, cues[i].earliest ?? 0);
+    const cap = env.suffixUpper[i];
+    if (lower > cap) {
+      return { conflictIndex: i, requiredStart: lower, allowedLatest: cap };
+    }
+    required = lower + cues[i].duration;
+  }
+  return null;
+}
+
 /** Same contract as analyzeMaxRetention with a configurable day span. */
 export function analyzeMaxRetentionWithSpan(
   cues: ReadonlyArray<Cue>,
@@ -125,21 +231,40 @@ export function analyzeMaxRetentionWithSpan(
   daySpan: number,
 ): RepairAnalysis {
   const n = cues.length;
-
-  // Prefix durations P[i] = sum_{k < i} duration[k].
-  const P = new Array<number>(n);
-  if (n > 0) {
-    P[0] = 0;
-    for (let i = 0; i + 1 < n; i++) P[i + 1] = P[i] + cues[i].duration;
+  const env = buildEnvelope(cues, daySpan);
+  if (env === null) {
+    return { kind: 'unrecoverable', reason: 'TOO_LONG' };
+  }
+  if (env.malformedIndex !== null) {
+    return {
+      kind: 'unrecoverable',
+      reason: 'INVALID_WINDOW',
+      conflictIndex: env.malformedIndex,
+    };
+  }
+  if (env.chainDuration > daySpan) {
+    return { kind: 'unrecoverable', reason: 'TOO_LONG' };
   }
 
-  if (n > 0 && P[n - 1] > daySpan) {
-    // The cues themselves do not fit in a day; releasing pins cannot help and
-    // no plan is generated.
-    return { kind: 'unrecoverable' };
+  const conflict = windowConflict(cues, env);
+  if (conflict !== null) {
+    return {
+      kind: 'unrecoverable',
+      reason: 'WINDOWS_INFEASIBLE',
+      ...conflict,
+    };
   }
 
-  const C = n === 0 ? daySpan : daySpan - P[n - 1];
+  // suffixUpper[i] is both the x-space cap for window feasibility and, after
+  // subtracting P[i], the transformed monotone upper envelope B[i]. The lower
+  // A envelope is one additional long array shared by pin filtering.
+  const upperEnvelope = env.suffixUpper;
+  const lowerEnvelope = new Array<number>(n);
+  let runningLower = 0;
+  for (let i = 0; i < n; i++) {
+    runningLower = Math.max(runningLower, (cues[i].earliest ?? 0) - env.prefix[i]);
+    lowerEnvelope[i] = runningLower;
+  }
 
   interface Item {
     idx: number;
@@ -151,18 +276,20 @@ export function analyzeMaxRetentionWithSpan(
 
   for (const [idx, start] of pins) {
     const okIndex = Number.isInteger(idx) && idx >= 0 && idx < n;
-    const pAt = okIndex ? P[idx] : 0;
-    if (
-      !okIndex ||
-      !Number.isInteger(start) ||
-      start - pAt < 0 ||
-      start - pAt > C
-    ) {
-      // Outside the constant feasible box (or structurally invalid): this pin
-      // must be released no matter which subset survives.
+    const pAt = okIndex ? env.prefix[idx] : 0;
+    const inOwnWindow =
+      okIndex &&
+      Number.isInteger(start) &&
+      start >= (cues[idx].earliest ?? 0) &&
+      start <= (cues[idx].latest ?? daySpan);
+
+    if (!okIndex || !Number.isInteger(start) || !inOwnWindow) {
       mandatory.push(idx);
     } else {
-      valid.push({ idx, start, y: start - P[idx] });
+      const y = start - pAt;
+      const transformedUpper = upperEnvelope[idx] - pAt;
+      if (y < lowerEnvelope[idx] || y > transformedUpper) mandatory.push(idx);
+      else valid.push({ idx, start, y });
     }
   }
   mandatory.sort((a, b) => a - b);
@@ -171,9 +298,7 @@ export function analyzeMaxRetentionWithSpan(
   const k = valid.length;
 
   // Forward tails pass gives the LNDS length L. The reverse pass records, for
-  // every position, the LNDS length beginning there — also a non-decreasing
-  // subsequence on the reversed negated values, i.e. LNDS of -y with an
-  // upper-bound tails.
+  // every position, the LNDS length beginning there.
   const lenStart = new Int32Array(k);
   const tails: number[] = [];
 
@@ -215,21 +340,13 @@ export function analyzeMaxRetentionWithSpan(
   groupY.forEach((y, pos) => oldToNew[groupId.get(y)!] = pos);
   for (let i = 0; i < k; i++) groupOf[i] = oldToNew[groupOf[i]];
 
-  // Bucket positions by the LNDS length they begin. When the reconstruction
-  // needs a remaining length `need`, every position with lenStart >= need is
-  // eligible — merging buckets L, L-1, ..., need in descending order.
+  // Bucket positions by the LNDS length they begin. Reconstruction merges
+  // buckets L, L-1, ..., need in descending order.
   const buckets: number[][] = Array.from({ length: L + 1 }, () => []);
   for (let i = 0; i < k; i++) buckets[lenStart[i]].push(i);
 
   // Greedy reconstruction of the lexicographically largest retained index set,
-  // equivalent to the lexicographically smallest complete release list (the
-  // mandatory entries are identical across every tie).
-  //
-  // At remaining length `need` the usable positions are exactly those already
-  // merged (lenStart >= need) with group >= firstGroup (y >= curVal). Each
-  // group leaf stores its largest merged position, so the range maximum over
-  // the suffix both certifies feasibility and returns the rightmost usable
-  // position in O(log k). O(k log k) time, O(k) space overall.
+  // equivalent to the lexicographically smallest complete release list.
   const seg = new SegMaxRange(groupY.length);
   const chosen = new Int32Array(L);
   let curVal = -Infinity;
@@ -244,7 +361,7 @@ export function analyzeMaxRetentionWithSpan(
       else lo = mid + 1;
     }
     const p = seg.maxRange(lo, groupY.length);
-    if (p < 0) return { kind: 'unrecoverable' };
+    if (p < 0) return { kind: 'unrecoverable', reason: 'WINDOWS_INFEASIBLE' };
     chosen[step] = p;
     curVal = valid[p].y;
   }
@@ -306,6 +423,7 @@ export function buildRepairPlan(
     draftRev: id.draftRev,
     baseRev: id.baseRev,
     pinsRev: id.pinsRev,
+    windowsRev: id.windowsRev,
     retainedPins: new Map(analysis.retainedPins),
     retainedCount: analysis.retainedCount,
     totalCount: analysis.totalCount,
@@ -315,10 +433,10 @@ export function buildRepairPlan(
 }
 
 /**
- * Apply a plan only while the draft, baseline and pin revisions are still the
- * ones it was generated with. On mismatch the action is EXPIRED: it reports
- * the conflict and produces no partial modification. On success it returns a
- * fresh pin map for the caller to install in one replacement.
+ * Apply a plan only while the draft, baseline, pin and window revisions are
+ * still the ones it was generated with. On mismatch the action is EXPIRED: it
+ * reports the conflict and produces no partial modification. On success it
+ * returns a fresh pin map for the caller to install in one replacement.
  */
 export function applyRepair(
   plan: RepairPlan,

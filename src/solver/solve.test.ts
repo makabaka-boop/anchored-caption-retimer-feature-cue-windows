@@ -19,29 +19,116 @@ interface TinyCase {
   durations: number[];
   base: number[];
   pins: Map<number, number>;
+  windows?: Array<{ earliest?: number; latest?: number }>;
   U: number;
 }
 
-function makeCues(c: Pick<TinyCase, 'durations' | 'base'>): Cue[] {
-  return c.durations.map((d, i) => ({ start: c.base[i], duration: d, text: `c${i}` }));
+interface WindowSpec {
+  earliest?: number;
+  latest?: number;
+}
+
+function makeCues(
+  c: Pick<TinyCase, 'durations' | 'base' | 'windows'>,
+): Cue[] {
+  return c.durations.map((d, i) => ({
+    start: c.base[i],
+    duration: d,
+    text: `c${i}`,
+    ...(c.windows?.[i] ?? {}),
+  }));
 }
 
 /**
- * Exact brute force over all feasible integer start vectors. Feasible
- * envelope in y-space:
- *   -P[i] <= y[i] <= U - (P[n-1] - P[i]), y non-decreasing, pins frozen.
- * Enumerates in ascending order, keeping the first minimum-cost vector, which
- * is the lexicographically smallest optimum.
+ * Exact brute force over all feasible integer start vectors. In y-space each
+ * coordinate has its own transformed window and y is non-decreasing. Enumerates
+ * in ascending order, keeping the first minimum-cost vector, which is the
+ * lexicographically smallest optimum. It also reports the first feasibility
+ * conflict using the same precedence required from the solver.
  */
-function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
+function bruteForce(
+  c: TinyCase,
+): {
+  starts: number[];
+  cost: number;
+  conflict:
+    | { reason: 'PIN_OUTSIDE_WINDOW'; index: number; required: number; lo: number; hi: number }
+    | { reason: 'WINDOW_CHAIN'; index: number; required: number; cap: number }
+    | { reason: 'INVALID_PIN'; index: number }
+    | null;
+} {
   const { n, durations, base, pins, U } = c;
   const P: number[] = new Array(n);
   P[0] = 0;
   for (let i = 1; i < n; i++) P[i] = P[i - 1] + durations[i - 1];
   const b = base.map((p, i) => p - P[i]);
+  const lower = c.windows?.map((w, i) => (w.earliest ?? 0) - P[i]) ?? new Array(n).fill(0);
+  const upper =
+    c.windows?.map((w, i) => (w.latest ?? U) - P[i]) ??
+    new Array(n).fill(U - P[n - 1]);
+  const C = U - P[n - 1];
+  for (let i = 0; i < n; i++) {
+    lower[i] = Math.max(lower[i], 0);
+    upper[i] = Math.min(upper[i], C);
+  }
 
-  // Held in an object so TypeScript does not narrow across the DFS closure's
-  // assignments.
+  // Independent x-space oracle for the required first-conflict diagnostics.
+  const sortedPins = [...pins.entries()].sort((a, b) => a[0] - b[0]);
+  for (const [idx, start] of sortedPins) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= n || !Number.isInteger(start) || start < 0 || start > U) {
+      return {
+        starts: [],
+        cost: Infinity,
+        conflict: { reason: 'INVALID_PIN', index: idx },
+      };
+    }
+  }
+
+  const suffixUpper = new Array<number>(n);
+  for (let i = n - 1; i >= 0; i--) {
+    const own = Math.min(c.windows?.[i]?.latest ?? U, U - (P[n - 1] - P[i]));
+    suffixUpper[i] =
+      i + 1 < n ? Math.min(own, suffixUpper[i + 1] - durations[i]) : own;
+  }
+
+  let required = 0;
+  for (let i = 0; i < n; i++) {
+    const lo = Math.max(required, c.windows?.[i]?.earliest ?? 0);
+    const cap = suffixUpper[i];
+    const pin = pins.get(i);
+    if (lo > cap) {
+      return {
+        starts: [],
+        cost: Infinity,
+        conflict: { reason: 'WINDOW_CHAIN', index: i, required: lo, cap },
+      };
+    }
+    if (
+      pin !== undefined &&
+      (pin < (c.windows?.[i]?.earliest ?? 0) || pin > (c.windows?.[i]?.latest ?? U))
+    ) {
+      return {
+        starts: [],
+        cost: Infinity,
+        conflict: {
+          reason: 'PIN_OUTSIDE_WINDOW',
+          index: i,
+          required: pin,
+          lo: c.windows?.[i]?.earliest ?? 0,
+          hi: c.windows?.[i]?.latest ?? U,
+        },
+      };
+    }
+    if (pin !== undefined && (pin < lo || pin > cap)) {
+      return {
+        starts: [],
+        cost: Infinity,
+        conflict: { reason: 'WINDOW_CHAIN', index: i, required: lo, cap },
+      };
+    }
+    required = (pin ?? lo) + durations[i];
+  }
+
   const state: { best: number[] | null; bestCost: number } = {
     best: null,
     bestCost: Infinity,
@@ -59,12 +146,8 @@ function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
       }
       return;
     }
-    // Bounds: under isotonicity the feasible set is exactly the constant
-    // box 0 <= y[i] <= C = U - P[n-1] (y[0] >= 0 forces every value >= 0;
-    // y[n-1] <= C forces every value <= C).
-    const C = U - P[n - 1];
-    let lo = Math.max(0, prev);
-    let hi = C;
+    let lo = Math.max(lower[i], prev);
+    let hi = upper[i];
     const pin = pins.get(i);
     if (pin !== undefined) {
       const v = pin - P[i];
@@ -79,10 +162,13 @@ function bruteForce(c: TinyCase): { starts: number[]; cost: number } | null {
   };
   dfs(0, -Infinity, 0);
 
-  if (state.best === null) return null;
+  if (state.best === null) {
+    return { starts: [], cost: Infinity, conflict: null };
+  }
   return {
     starts: state.best.map((v, i) => v + P[i]),
     cost: state.bestCost,
+    conflict: null,
   };
 }
 
@@ -112,13 +198,49 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
           pins.set(i, Math.max(0, base[i] + Math.floor(rand() * 7) - 3));
         }
       }
-      const c: TinyCase = { n, durations, base, pins, U };
+      const windows: WindowSpec[] | undefined =
+        rand() < 0.8
+          ? Array.from({ length: n }, () => {
+              const w: WindowSpec = {};
+              if (rand() < 0.75) w.earliest = Math.min(U, Math.floor(rand() * (U + 2)));
+              if (rand() < 0.75) w.latest = Math.min(U, Math.floor(rand() * (U + 2)));
+              if (
+                w.earliest !== undefined &&
+                w.latest !== undefined &&
+                w.earliest > w.latest
+              ) {
+                return { latest: w.earliest, earliest: w.latest };
+              }
+              return w;
+            })
+          : undefined;
+      const c: TinyCase = { n, durations, base, pins, windows, U };
       const expected = bruteForce(c);
       const actual = runSolver(c);
-      if (expected === null) {
-        expect(actual.ok, `case ${t}: expected INFEASIBLE`).toBe(false);
+      if (expected.cost === Infinity) {
+        expect(actual.ok, `case ${t}: expected infeasible`).toBe(false);
+        if (!actual.ok && expected.conflict) {
+          expect(actual.reason).toBe(expected.conflict.reason);
+          expect(actual.conflictIndex).toBe(expected.conflict.index);
+          if (actual.reason === 'WINDOW_CHAIN' && expected.conflict.reason === 'WINDOW_CHAIN') {
+            expect(actual.requiredStart).toBe(expected.conflict.required);
+            expect(actual.allowedLatest).toBe(expected.conflict.cap);
+          }
+          if (
+            actual.reason === 'PIN_OUTSIDE_WINDOW' &&
+            expected.conflict.reason === 'PIN_OUTSIDE_WINDOW'
+          ) {
+            expect(actual.requiredStart).toBe(expected.conflict.required);
+            expect(actual.allowedEarliest).toBe(expected.conflict.lo);
+            expect(actual.allowedLatest).toBe(expected.conflict.hi);
+          }
+          if (expected.conflict.reason === 'INVALID_PIN') {
+            expect(actual.reason).toBe('INVALID_PIN');
+            expect(actual.conflictIndex).toBe(expected.conflict.index);
+          }
+        }
       } else {
-        expect(actual.ok, `case ${t}: unexpected INFEASIBLE`).toBe(true);
+        expect(actual.ok, `case ${t}: unexpected infeasible`).toBe(true);
         if (actual.ok) {
           expect(actual.cost, `case ${t}: cost`).toBe(expected.cost);
           expect(actual.starts, `case ${t}: vector`).toEqual(expected.starts);
@@ -129,9 +251,9 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
 
   it('grid-exhaustively matches brute force for all short sequences and pin sets', () => {
     // Every n <= 3 sequence with durations in 1..2, bases in 0..3, tight or
-    // slack day spans, every cue subset pinned to each grid value (plus one
-    // out-of-range pin). Covers even-block ties and every critical pin
-    // boundary; brute force is the reference for target value and full vector.
+    // slack day spans, common cut windows, and every pin subset/grid value.
+    // Brute force is the reference for feasibility, diagnostics, target value
+    // and full vector.
     const cart = <T>(sets: T[][]): T[][] =>
       sets.reduce<T[][]>(
         (acc, s) => acc.flatMap((prefix) => s.map((v) => [...prefix, v])),
@@ -149,38 +271,70 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
         const P: number[] = new Array(n).fill(0);
         for (let i = 1; i < n; i++) P[i] = P[i - 1] + durations[i - 1];
         for (const U of [P[n - 1], P[n - 1] + 2]) {
+          const perCueOptions: WindowSpec[] = [
+            {},
+            { earliest: 0 },
+            { earliest: U },
+            { latest: 0 },
+            { latest: U },
+          ];
+          // Keep the full window Cartesian product bounded: n <= 2 still
+          // covers every one/two-cue window combination; n = 3 retains the
+          // complete no-window regression grid, while random cases below and
+          // the repair oracle exercise multi-cue windows.
+          const windowChoices: WindowSpec[][] =
+            n <= 2
+              ? cart(range(n).map(() => perCueOptions))
+              : [new Array<WindowSpec>(n).fill({})];
           for (const base of baseGrids) {
-            for (let mask = 0; mask < 1 << n; mask++) {
-              const basePins = range(n)
-                .filter((i) => mask & (1 << i))
-                .map((i) => [i, base[i]] as const);
-              // Pin values: the baseline value, every envelope grid point on
-              // the first pinned cue, and one value just past the span.
-              const firstPinned = basePins[0]?.[0];
-              const variants: number[] =
-                firstPinned === undefined
-                  ? [0]
-                  : [base[firstPinned], ...range(U + 1), U + 1];
-              for (const v of variants) {
-                const pins = new Map(basePins);
-                if (firstPinned !== undefined) pins.set(firstPinned, v);
-                const c: TinyCase = { n, durations, base, pins, U };
-                const expected = bruteForce(c);
-                const actual = runSolver(c);
-                if (expected === null) {
-                  expect(actual.ok, `${JSON.stringify(c)}`).toBe(false);
-                  infeasible++;
-                } else {
-                  expect(actual.ok, `${JSON.stringify(c)}`).toBe(true);
-                  if (actual.ok) {
-                    expect(actual.cost, `${JSON.stringify(c)}`).toBe(
-                      expected.cost,
-                    );
-                    expect(actual.starts, `${JSON.stringify(c)}`).toEqual(
-                      expected.starts,
-                    );
+            for (const windows of windowChoices) {
+              for (let mask = 0; mask < 1 << n; mask++) {
+                const basePins = range(n)
+                  .filter((i) => mask & (1 << i))
+                  .map((i) => [i, base[i]] as const);
+                const firstPinned = basePins[0]?.[0];
+                const variants: number[] =
+                  firstPinned === undefined
+                    ? [0]
+                    : [
+                        base[firstPinned],
+                        0,
+                        U,
+                        Math.max(0, Math.floor(U / 2)),
+                        U + 1,
+                        -1,
+                        (windows[firstPinned].earliest ?? 0) - 1,
+                        (windows[firstPinned].latest ?? U) + 1,
+                      ];
+                for (const v of variants) {
+                  const pins = new Map(basePins);
+                  if (firstPinned !== undefined) pins.set(firstPinned, v);
+                  const c: TinyCase = { n, durations, base, pins, windows, U };
+                  const expected = bruteForce(c);
+                  const actual = runSolver(c);
+                  if (expected.cost === Infinity) {
+                    expect(actual.ok, `${JSON.stringify(c)}`).toBe(false);
+                    if (!actual.ok && expected.conflict) {
+                      expect(actual.reason, `${JSON.stringify(c)}`).toBe(
+                        expected.conflict.reason,
+                      );
+                      expect(actual.conflictIndex, `${JSON.stringify(c)}`).toBe(
+                        expected.conflict.index,
+                      );
+                    }
+                    infeasible++;
+                  } else {
+                    expect(actual.ok, `${JSON.stringify(c)}`).toBe(true);
+                    if (actual.ok) {
+                      expect(actual.cost, `${JSON.stringify(c)}`).toBe(
+                        expected.cost,
+                      );
+                      expect(actual.starts, `${JSON.stringify(c)}`).toEqual(
+                        expected.starts,
+                      );
+                    }
+                    checked++;
                   }
-                  checked++;
                 }
               }
             }
@@ -216,8 +370,8 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
     const expected = bruteForce(c);
     const actual = runSolver(c);
     expect(actual.ok).toBe(true);
-    expect(expected).not.toBeNull();
-    if (actual.ok && expected) {
+    expect(expected.cost).not.toBe(Infinity);
+    if (actual.ok && expected.cost !== Infinity) {
       expect(actual.cost).toBe(expected.cost);
       expect(actual.starts).toEqual(expected.starts);
       // interior constant block at lower median y = 3 -> x = 6i + 3
@@ -237,12 +391,12 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
     };
     const expected = bruteForce(c);
     const actual = runSolver(c);
-    expect(expected).not.toBeNull();
+    expect(expected.cost).not.toBe(Infinity);
     expect(actual.ok).toBe(true);
     if (actual.ok) {
       expect(actual.cost).toBe(1);
       expect(actual.starts).toEqual([0, 8, 14]);
-      expect(actual.starts).toEqual(expected!.starts);
+      expect(actual.starts).toEqual(expected.starts);
     }
   });
 
@@ -262,7 +416,7 @@ describe('solver vs exhaustive brute force (tiny instances)', () => {
     if (actual.ok) {
       expect(actual.cost).toBe(4);
       expect(actual.starts).toEqual([0, 8, 14, 20, 26]);
-      expect(actual.starts).toEqual(expected!.starts);
+      expect(actual.starts).toEqual(expected.starts);
     }
   });
 });
@@ -310,6 +464,42 @@ describe('pin critical conflicts -> INFEASIBLE', () => {
       pins: new Map([[0, realDay - 10]]),
     });
     expect(edge.ok).toBe(true);
+  });
+
+  it('distinguishes a self-window pin violation from a propagated chain conflict', () => {
+    const cues = makeCues({ durations: [5, 5], base: [0, 5], windows: [{}, { earliest: 0, latest: 30 }] });
+    const self = solveWithSpan(cues, [0, 5], new Map([[1, 31]]), 50);
+    expect(self.ok).toBe(false);
+    if (!self.ok) {
+      expect(self.reason).toBe('PIN_OUTSIDE_WINDOW');
+      if (self.reason === 'PIN_OUTSIDE_WINDOW') {
+        expect(self.conflictIndex).toBe(1);
+        expect(self.requiredStart).toBe(31);
+        expect(self.allowedEarliest).toBe(0);
+        expect(self.allowedLatest).toBe(30);
+      }
+    }
+
+    const chainedCues = makeCues({
+      durations: [5, 5],
+      base: [0, 5],
+      windows: [{ earliest: 20, latest: 20 }, { earliest: 0, latest: 40 }],
+    });
+    const chained = solveWithSpan(
+      chainedCues,
+      [0, 5],
+      new Map([[1, 22]]),
+      40,
+    );
+    expect(chained.ok).toBe(false);
+    if (!chained.ok) {
+      expect(chained.reason).toBe('WINDOW_CHAIN');
+      if (chained.reason === 'WINDOW_CHAIN') {
+        expect(chained.conflictIndex).toBe(1);
+        expect(chained.requiredStart).toBe(25);
+        expect(chained.allowedLatest).toBe(40);
+      }
+    }
   });
 
   it('pin out of day range or at an invalid index', () => {
@@ -489,8 +679,9 @@ describe('performance at n = 20000', () => {
 describe('parseCues strict validation', () => {
   const valid = JSON.stringify({
     cues: [
-      { start: 0, duration: 100, text: 'a' },
-      { start: 100, duration: 100, text: 'bb' },
+      { start: 0, duration: 100, text: 'a', earliest: 0, latest: 90 },
+      { start: 100, duration: 100, text: 'bb', earliest: 50 },
+      { start: 250, duration: 100, text: 'cc', latest: 900 },
     ],
   });
 
@@ -507,6 +698,10 @@ describe('parseCues strict validation', () => {
     ['root extra key', JSON.stringify({ cues: [], extra: 1 })],
     ['cues empty', JSON.stringify({ cues: [] })],
     ['cue extra key', JSON.stringify({ cues: [{ start: 0, duration: 1, text: 'a', x: 1 }] })],
+    ['negative earliest', JSON.stringify({ cues: [{ start: 0, duration: 1, text: 'a', earliest: -1 }] })],
+    ['latest past day', JSON.stringify({ cues: [{ start: 0, duration: 1, text: 'a', latest: 86400001 }] })],
+    ['non-integer latest', JSON.stringify({ cues: [{ start: 0, duration: 1, text: 'a', latest: 1.5 }] })],
+    ['reversed window', JSON.stringify({ cues: [{ start: 1, duration: 1, text: 'a', earliest: 2, latest: 1 }] })],
     ['cue missing text', JSON.stringify({ cues: [{ start: 0, duration: 1 }] })],
     ['negative start', JSON.stringify({ cues: [{ start: -1, duration: 1, text: 'a' }] })],
     ['start past day', JSON.stringify({ cues: [{ start: 86400001, duration: 1, text: 'a' }] })],
@@ -521,12 +716,42 @@ describe('parseCues strict validation', () => {
     expect(parseCues(text).ok).toBe(false);
   });
 
+  it('keeps old three-field documents and output on the all-day window', () => {
+    const old = JSON.stringify({
+      cues: [{ start: 0, duration: 1, text: 'a' }],
+    });
+    const parsed = parseCues(old);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.cues[0].earliest).toBeUndefined();
+    expect(parsed.cues[0].latest).toBeUndefined();
+    const out = JSON.parse(toCuesJson(parsed.cues, [0]));
+    expect(out.cues[0]).toEqual({ start: 0, duration: 1, text: 'a' });
+  });
+
   it('round-trips through toCuesJson with new starts', () => {
     const parsed = parseCues(valid);
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    const json = JSON.parse(toCuesJson(parsed.cues, [5, 105]));
-    expect(json.cues[0]).toEqual({ start: 5, duration: 100, text: 'a' });
-    expect(json.cues[1]).toEqual({ start: 105, duration: 100, text: 'bb' });
+    const json = JSON.parse(toCuesJson(parsed.cues, [5, 105, 250]));
+    expect(json.cues[0]).toEqual({
+      start: 5,
+      duration: 100,
+      text: 'a',
+      earliest: 0,
+      latest: 90,
+    });
+    expect(json.cues[1]).toEqual({
+      start: 105,
+      duration: 100,
+      text: 'bb',
+      earliest: 50,
+    });
+    expect(json.cues[2]).toEqual({
+      start: 250,
+      duration: 100,
+      text: 'cc',
+      latest: 900,
+    });
   });
 });
